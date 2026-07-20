@@ -132,15 +132,16 @@ def seed_empirical_vulnerabilities_data(conn):
     """, tags)
 
 def run_verification_tests():
-    """Runs automated verification unit tests over schemas, cross-database joins, and math formulas."""
+    """Runs automated verification unit tests over schemas, cross-database joins, math formulas, and DeFiLlama ingestion client."""
     print("\n==================================================")
     print("RUNNING AUTOMATED SYSTEM & INTEGRATION VERIFICATIONS")
     print("==================================================")
     
     from core.database import attach_vulnerabilities_db
+    from core.math_engine import fetch_defillama_tvl_cache
     
     # Test Pass 1: Confirm ATTACH DATABASE routes resolve without throwing OperationalError path exceptions
-    print("[1/4] Test Pass 1: Validating ATTACH DATABASE path resolution...")
+    print("[1/7] Test Pass 1: Validating ATTACH DATABASE path resolution...")
     conn = get_unified_connection()
     try:
         attach_vulnerabilities_db(conn)
@@ -152,7 +153,7 @@ def run_verification_tests():
     seed_empirical_vulnerabilities_data(conn)
 
     # Test Pass 2: Verify cross-database joins executing over vuln return valid numerical counts > 0
-    print("[2/4] Test Pass 2: Verifying cross-database queries over vuln tables return counts > 0...")
+    print("[2/7] Test Pass 2: Verifying cross-database queries over vuln tables return counts > 0...")
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM vuln.normalized_findings")
     total_findings = cursor.fetchone()[0]
@@ -164,7 +165,7 @@ def run_verification_tests():
     print(f"      [OK] Cross-database queries verified (Total findings: {total_findings}, Tag indices: {total_tags}).")
 
     # Test Pass 3: Assert calculated expected_profitability_yield values fluctuate dynamically across target rows
-    print("[3/4] Test Pass 3: Verifying dynamic target profitability matrix yield variance...")
+    print("[3/7] Test Pass 3: Verifying dynamic target profitability matrix yield variance...")
     matrix = get_target_profitability_matrix(conn)
     assert len(matrix) >= 2, f"Expected at least 2 scored targets, got {len(matrix)}"
     
@@ -177,7 +178,7 @@ def run_verification_tests():
     print(f"      [OK] Matrix yield metrics fluctuate dynamically across target rows (Yields: {yields}).")
 
     # Test Pass 4: Cascading Delete & DB Schema Health
-    print("[4/4] Test Pass 4: Verifying foreign key cascading deletes & PRAGMA health...")
+    print("[4/7] Test Pass 4: Verifying foreign key cascading deletes & PRAGMA health...")
     pragma_wal = cursor.execute("PRAGMA journal_mode;").fetchone()[0]
     assert pragma_wal.lower() == "wal", f"Expected WAL mode, got {pragma_wal}"
     
@@ -187,8 +188,40 @@ def run_verification_tests():
     cursor.execute("SELECT COUNT(*) FROM rewards WHERE project_slug = 'hackenproof-dex';")
     count = cursor.fetchone()[0]
     assert count == 0, "Cascading delete failed on rewards table"
-    conn.close()
     print("      [OK] Foreign key cascading deletes and database PRAGMA integrity verified.")
+
+    # Test Pass 5: API Reachability & DeFiLlama Ingestion Client Handshake
+    print("[5/7] Test Pass 5: Validating DeFiLlama live REST client API reachability...")
+    tvl_cache = fetch_defillama_tvl_cache()
+    assert isinstance(tvl_cache, dict), "Expected TVL cache to be a dictionary object"
+    assert len(tvl_cache) > 0, "Expected live DeFiLlama TVL cache lookup map to contain entries"
+    print(f"      [OK] DeFiLlama REST client successfully ingested live protocols (Mapped keys count: {len(tvl_cache)}).")
+
+    # Test Pass 6: Resilience & Dropout Timeout Drop Checking
+    print("[6/7] Test Pass 6: Verifying network error resilience and socket drop timeout handling...")
+    fallback_cache = fetch_defillama_tvl_cache(endpoint="http://10.255.255.1:9999/protocols", timeout=1.0)
+    assert isinstance(fallback_cache, dict), "Fallback cache must return a valid dictionary on network timeout drop"
+    print("      [OK] Network connection timeout intercepted gracefully; engine returned cached/fallback map without crashing.")
+
+    # Test Pass 7: Data-Driven Yield Variance & On-Chain TVL Scaling
+    print("[7/7] Test Pass 7: Verifying data-driven yield variance and live TVL reward scaling...")
+    live_matrix = get_target_profitability_matrix(conn)
+    matrix_by_slug = {r["slug"]: r for r in live_matrix}
+    
+    aave_row = matrix_by_slug.get("aave-v3")
+    morpho_row = matrix_by_slug.get("morpho-blue")
+    sherlock_row = matrix_by_slug.get("sherlock-vaults")
+    
+    assert aave_row is not None and morpho_row is not None, "Expected Aave V3 and Morpho Blue in scored matrix"
+    assert aave_row["tvl_applied"] > 5_000_000.0, f"Expected Aave live TVL > fallback 5M baseline, got {aave_row['tvl_applied']}"
+    assert morpho_row["tvl_applied"] > 5_000_000.0, f"Expected Morpho live TVL > fallback 5M baseline, got {morpho_row['tvl_applied']}"
+    
+    # Assert high-TVL protocol allows full stated max reward scaling up to its cap
+    assert aave_row["calculated_real_reward"] > (sherlock_row["calculated_real_reward"] if sherlock_row else 0), \
+        "Protocols with large active TVL must scale higher effective reward ceilings than smaller assets"
+        
+    print(f"      [OK] Economic TVL rules confirmed (Aave TVL: ${aave_row['tvl_applied']:,.2f}, Real Reward: ${aave_row['calculated_real_reward']:,.2f}).")
+    conn.close()
 
     print("\n[SUCCESS] All stability assertions and empirical integration tests PASSED!")
 

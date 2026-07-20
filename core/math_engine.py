@@ -1,7 +1,62 @@
 import math
+import re
+import json
+import time
+import threading
+import urllib.request
 from typing import Dict, List, Any
 
 from core.database import attach_vulnerabilities_db
+
+_TVL_CACHE: Dict[str, float] = {}
+_CACHE_TIMESTAMP: float = 0.0
+_CACHE_TTL_SECONDS: float = 1800.0  # 30-minute retention horizon
+_CACHE_LOCK = threading.Lock()
+
+def fetch_defillama_tvl_cache(endpoint: str = "https://api.llama.fi/protocols", timeout: float = 4.0) -> Dict[str, float]:
+    """
+    Builds a resilient, caching HTTP request client utilizing standard library tools (urllib.request)
+    to query DeFiLlama's open endpoint and index protocol tokens, names, and slugs directly to current TVL numbers.
+    Thread-safe and failsafe with fallback to existing cache or default fallback map.
+    """
+    global _TVL_CACHE, _CACHE_TIMESTAMP
+
+    with _CACHE_LOCK:
+        now = time.time()
+        if _TVL_CACHE and (now - _CACHE_TIMESTAMP < _CACHE_TTL_SECONDS):
+            return _TVL_CACHE
+
+        try:
+            req = urllib.request.Request(
+                endpoint,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode("utf-8"))
+                    new_cache: Dict[str, float] = {}
+                    if isinstance(data, list):
+                        for p in data:
+                            tvl_val = float(p.get("tvl", 0.0) or 0.0)
+                            slug = str(p.get("slug", "") or "").strip().lower()
+                            name = str(p.get("name", "") or "").strip().lower()
+                            symbol = str(p.get("symbol", "") or "").strip().lower()
+
+                            if slug:
+                                new_cache[slug] = tvl_val
+                            if name:
+                                new_cache[name] = tvl_val
+                            if symbol:
+                                new_cache[symbol] = tvl_val
+
+                    _TVL_CACHE = new_cache
+                    _CACHE_TIMESTAMP = now
+                    return _TVL_CACHE
+        except Exception as e:
+            print(f"[!] Warning: DeFiLlama TVL ingestion error on {endpoint}: {e}")
+            return _TVL_CACHE if _TVL_CACHE else {}
+
+    return _TVL_CACHE
 
 def calculate_success_probability(
     audits_count: int,
@@ -58,7 +113,8 @@ def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
     """
     Fetches target programs, mounts historical vulnerabilities tracking ledger ('vulnerabilities.db'),
     calculates mathematical profitability metrics using individual row parameters, relational tag counts,
-    and child asset counts, and returns a sorted list matching the ProfitabilityRow schema.
+    live DeFiLlama TVL ingestion cache with fallback clamping, and child asset counts.
+    Returns a sorted list matching the ProfitabilityRow schema.
     """
     # 1. Mount attached vulnerabilities database safely
     attach_vulnerabilities_db(conn)
@@ -82,12 +138,16 @@ def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
     except Exception:
         tag_density_lookup = {}
 
-    # 4. Query projects joined with rewards aggregation, assets count, and known issues count
+    # 4. Fetch live DeFiLlama TVL lookup cache
+    tvl_cache = fetch_defillama_tvl_cache()
+
+    # 5. Query projects joined with rewards aggregation, assets count, and known issues count
     query = """
     SELECT 
         p.slug,
         p.project_name,
         p.source_platform,
+        p.github_url,
         p.max_bounty_usd,
         p.primacy_model,
         p.scaling_percentage,
@@ -123,9 +183,11 @@ def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
     matrix = []
     
     for row in rows:
-        slug = row["slug"]
-        project_name = row["project_name"]
+        slug = str(row["slug"] or "").strip().lower()
+        project_name = str(row["project_name"] or "").strip()
+        project_name_lower = project_name.lower()
         source_platform = row["source_platform"]
+        github_url = row["github_url"]
         stated_max_reward = float(row["max_bounty_usd"] or row["calculated_max_reward"] or 0)
         
         scaling_pct = row["scaling_percentage"]
@@ -155,7 +217,40 @@ def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
         nesting_depth_modifier = 1.0 + (0.05 * min(10, files_count))
         t_index = calculate_complexity_time_index(files_count, nesting_depth_modifier, kyc_required)
         
-        tvl_applied = 15_000_000.0
+        # Resolve TVL dynamically using tiered lookup rules
+        tvl_applied = None
+        
+        # Step 1 & Step 2: Direct lookup on slug or project_name
+        if slug in tvl_cache:
+            tvl_applied = tvl_cache[slug]
+        elif project_name_lower in tvl_cache:
+            tvl_applied = tvl_cache[project_name_lower]
+        else:
+            # Check slug/name prefix matches if direct match failed (e.g. "aave-v3" -> "aave")
+            slug_prefix = slug.split("-")[0]
+            if slug_prefix in tvl_cache:
+                tvl_applied = tvl_cache[slug_prefix]
+            else:
+                name_prefix = project_name_lower.split()[0]
+                if name_prefix in tvl_cache:
+                    tvl_applied = tvl_cache[name_prefix]
+
+        # Step 3: Parse repository name from GitHub URL using regex if unmatched
+        if tvl_applied is None:
+            match = re.search(r"github\.com/([^/]+)/([^/]+)", str(github_url or ""))
+            repo_name = match.group(2).strip().lower().rstrip("/") if match else None
+            if repo_name:
+                if repo_name in tvl_cache:
+                    tvl_applied = tvl_cache[repo_name]
+                else:
+                    repo_prefix = repo_name.split("-")[0]
+                    if repo_prefix in tvl_cache:
+                        tvl_applied = tvl_cache[repo_prefix]
+
+        # Step 4: Fallback boundary default
+        if tvl_applied is None or tvl_applied <= 0:
+            tvl_applied = 5_000_000.0
+
         c_time = 150.0
         
         # Explicit mathematical clamping rule
@@ -172,7 +267,7 @@ def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
         )
         
         matrix.append({
-            "slug": slug,
+            "slug": row["slug"],
             "project_name": project_name,
             "source_platform": source_platform,
             "normalized_impact": normalized_impact,
