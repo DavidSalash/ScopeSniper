@@ -4,6 +4,7 @@ from pathlib import Path
 
 DB_LOCK = threading.Lock()
 DB_FILE = Path("/app/data_store/unified_bug_bounties.db") if Path("/app").exists() else Path("C:/users/david/unified_bug_bounties.db")
+VULNERABILITIES_DB_FILE = Path("/app/data_store/vulnerabilities.db") if Path("/app").exists() else Path("C:/users/david/vulnerabilities.db")
 
 def get_unified_connection():
     DB_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -13,6 +14,25 @@ def get_unified_connection():
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
     return conn
+
+def attach_vulnerabilities_db(conn: sqlite3.Connection) -> None:
+    """
+    Dynamically mounts the historical vulnerabilities tracking ledger ('vulnerabilities.db')
+    as schema alias 'vuln' on the given active SQLite connection.
+    Safely intercepts OperationalError if already attached in the active thread connection session.
+    Enforces row factory mapping (conn.row_factory = sqlite3.Row).
+    """
+    conn.row_factory = sqlite3.Row
+    resolved_path = str(VULNERABILITIES_DB_FILE).replace("\\", "/")
+    try:
+        conn.execute(f"ATTACH DATABASE '{resolved_path}' AS vuln;")
+    except sqlite3.OperationalError as e:
+        err_str = str(e).lower()
+        if "already" in err_str and ("attached" in err_str or "in use" in err_str):
+            pass
+        else:
+            raise e
+
 
 def init_unified_db():
     conn = get_unified_connection()

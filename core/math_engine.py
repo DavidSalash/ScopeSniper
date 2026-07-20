@@ -1,13 +1,30 @@
 import math
 from typing import Dict, List, Any
 
-def calculate_success_probability(audits_count: int) -> float:
+from core.database import attach_vulnerabilities_db
+
+def calculate_success_probability(
+    audits_count: int,
+    global_tag_findings: int = 0,
+    total_global_findings: int = 0
+) -> float:
     """
-    Computes statistical probability index based on historical flaw density/audit counts:
-    P_success = 1 / (1 + ln(1 + Audits Count))
+    Computes statistical probability index combining global tag density with target audit counts:
+    P_success = (Global Findings for Tag / Total Global Findings Pool) * (1 / (1 + ln(1 + Audits Count)))
+
+    Fallback protection:
+    If total_global_findings <= 0 or global_tag_findings <= 0, returns a strict fallback baseline of 0.0001
+    to prevent division by zero or absolute zero dropouts.
     """
+    if total_global_findings <= 0 or global_tag_findings <= 0:
+        return 0.0001
+    
+    density_ratio = float(global_tag_findings) / float(total_global_findings)
     safe_audits = max(0, audits_count)
-    return 1.0 / (1.0 + math.log(1.0 + safe_audits))
+    audit_factor = 1.0 / (1.0 + math.log(1.0 + safe_audits))
+    
+    p_success = density_ratio * audit_factor
+    return max(0.0001, p_success)
 
 def calculate_complexity_time_index(files_count: int, nesting_depth_modifier: float, kyc_required: bool) -> float:
     """
@@ -39,12 +56,33 @@ def calculate_expected_profitability_yield(
 
 def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
     """
-    Fetches target programs, calculates mathematical profitability metrics using individual
-    row parameters and child asset counts, and returns a sorted list matching the ProfitabilityRow schema.
+    Fetches target programs, mounts historical vulnerabilities tracking ledger ('vulnerabilities.db'),
+    calculates mathematical profitability metrics using individual row parameters, relational tag counts,
+    and child asset counts, and returns a sorted list matching the ProfitabilityRow schema.
     """
+    # 1. Mount attached vulnerabilities database safely
+    attach_vulnerabilities_db(conn)
     cursor = conn.cursor()
     
-    # Query projects joined with rewards aggregation and child assets counts
+    # 2. Query total global findings pool across ecosystem safely with fallback
+    total_global_findings = 0
+    try:
+        cursor.execute("SELECT COUNT(*) FROM vuln.normalized_findings")
+        res = cursor.fetchone()
+        if res:
+            total_global_findings = int(res[0] or 0)
+    except Exception:
+        total_global_findings = 0
+
+    # 3. Pre-compile global tag frequencies into memory to eliminate N+1 loop queries
+    tag_density_lookup = {}
+    try:
+        cursor.execute("SELECT tag, COUNT(*) as cnt FROM vuln.vulnerability_tags_index GROUP BY tag")
+        tag_density_lookup = {r["tag"]: r["cnt"] for r in cursor.fetchall()}
+    except Exception:
+        tag_density_lookup = {}
+
+    # 4. Query projects joined with rewards aggregation, assets count, and known issues count
     query = """
     SELECT 
         p.slug,
@@ -98,30 +136,27 @@ def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
         privilege_tier = row["privilege_tier"] if row["privilege_tier"] in ['unprivileged', 'moderator', 'admin', 'trusted_multisig'] else 'unprivileged'
         normalized_impact = row["normalized_impact"] or "Critical Logic Defect"
         
+        # Fast memory lookup for target impact tag density
+        global_tag_findings = tag_density_lookup.get(normalized_impact, 0)
+            
         # Row-specific dynamic parameter calculations
         child_assets = int(row["child_asset_count"] or 0)
-        files_count = max(1, child_assets if child_assets > 0 else 5)
+        files_count = child_assets if child_assets > 0 else 5
         
         known_issues = int(row["known_issues_count"] or 0)
-        audits_count = max(0, 2 + known_issues)
+        audits_count = 2 + known_issues
         
-        p_success = calculate_success_probability(audits_count=audits_count)
+        p_success = calculate_success_probability(
+            audits_count=audits_count,
+            global_tag_findings=global_tag_findings,
+            total_global_findings=total_global_findings
+        )
+        
         nesting_depth_modifier = 1.0 + (0.05 * min(10, files_count))
         t_index = calculate_complexity_time_index(files_count, nesting_depth_modifier, kyc_required)
         
-        # Platform-tailored TVL and time-cost bounds
-        if source_platform == "immunefi":
-            tvl_applied = 15_000_000.0
-            c_time = 150.0
-        elif source_platform == "cantina":
-            tvl_applied = 15_000_000.0
-            c_time = 150.0
-        elif source_platform == "sherlock":
-            tvl_applied = 15_000_000.0
-            c_time = 150.0
-        else:
-            tvl_applied = 15_000_000.0
-            c_time = 150.0
+        tvl_applied = 15_000_000.0
+        c_time = 150.0
         
         # Explicit mathematical clamping rule
         economic_cap = alpha * tvl_applied
@@ -153,3 +188,4 @@ def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
         
     matrix.sort(key=lambda x: x["expected_profitability_yield"], reverse=True)
     return matrix
+

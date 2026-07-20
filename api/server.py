@@ -306,12 +306,32 @@ def export_simplified():
     }
     return JSONResponse(content=export_payload)
 
+import math
+
 @app.get("/api/analytics/profitability-matrix")
 def get_profitability_matrix():
     conn = get_unified_connection()
     try:
         matrix = get_target_profitability_matrix(conn)
-        return {"status": "success", "count": len(matrix), "data": matrix}
+        sanitized_matrix = []
+        
+        float_fields = [
+            "stated_max_reward", "calculated_real_reward", "tvl_applied",
+            "complexity_time_cost", "success_probability", "expected_profitability_yield"
+        ]
+        
+        for row in matrix:
+            clean_row = dict(row)
+            for field in float_fields:
+                val = clean_row.get(field)
+                if val is not None and isinstance(val, (int, float)):
+                    if math.isnan(val) or math.isinf(val):
+                        clean_row[field] = 0.0
+                    else:
+                        clean_row[field] = round(float(val), 4)
+            sanitized_matrix.append(clean_row)
+            
+        return {"status": "success", "count": len(sanitized_matrix), "data": sanitized_matrix}
     finally:
         conn.close()
 
