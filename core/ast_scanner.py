@@ -7,17 +7,10 @@ def strip_comments_and_strings(code: str) -> str:
     """
     Strips single-line // comments, multi-line /* */ comments,
     and string literals ("..." and '...') from Solidity code.
-    Replaces string/comment characters with spaces to preserve line lengths.
+    Replaces string/comment characters with spaces to preserve character index offsets.
     """
-    def replacer(match):
-        s = match.group(0)
-        if s.startswith('/'):
-            return ' ' * len(s)
-        else:
-            return ' ' * len(s)
-
-    pattern = r'//.*?$|/\*.*?\*/|\'(?:\\.|[^\\\'])*\'|"(?:\\.|[^\\"])*"'
-    return re.sub(pattern, replacer, code, flags=re.DOTALL | re.MULTILINE)
+    pattern = r'//[^\n]*|/\*.*?\*/|\'(?:\\.|[^\\\'])*\'|"(?:\\.|[^\\"])*"'
+    return re.sub(pattern, lambda m: ' ' * len(m.group(0)), code, flags=re.DOTALL | re.MULTILINE)
 
 def scan_solidity_source_metrics(project_slug: str, asset_identifier: str, source_code: str) -> Dict[str, Any]:
     """
@@ -29,7 +22,7 @@ def scan_solidity_source_metrics(project_slug: str, asset_identifier: str, sourc
     """
     clean_code = strip_comments_and_strings(source_code)
 
-    # 1. total_functions: Match function declarations via r"\bfunction\s+(\w+)" or function keyword
+    # 1. total_functions: Match function declarations via r"\bfunction\s+(\w+)"
     func_pattern = r"\bfunction\s+(\w+)"
     functions = re.findall(func_pattern, clean_code)
     total_functions = len(functions)
@@ -42,63 +35,51 @@ def scan_solidity_source_metrics(project_slug: str, asset_identifier: str, sourc
     # 3. state_mutations_count: Match assignment / mutation operators
     # Exclude comparison operators (==, >=, <=, !=, =>)
     # Match =, +=, -=, *=, /=, %=, |=, &=, ^=, ++, --
-    # Handle exclude logic cleanly by regex matching comparison operators first or filtering
     mutation_pattern = r"(?:==|>=|<=|!=|=>)|(\+\+|--|\+=|-=|\*=|/=|%=|\|=|&=|\^=|=)"
     mutations_count = 0
     for match in re.finditer(mutation_pattern, clean_code):
-        if match.group(1):  # Group 1 matched the mutation operator, not comparison
+        if match.group(1):  # Group 1 matched mutation operator
             mutations_count += 1
     state_mutations_count = mutations_count
 
-    # 4. max_loop_depth: Trace loop patterns and brace depth
-    # Loop pattern matches for(...) or while(...) followed by { or opening brace
-    # We walk the tokenized/character structure of clean_code
+    # 4. max_loop_depth: Trace loop patterns and brace depth with balanced paren matching
+    loop_brace_positions = set()
+    has_braceless_loop = False
+
+    for loop_match in re.finditer(r"\b(for|while)\b", clean_code):
+        start_idx = loop_match.end()
+        # Find opening '(' of loop header
+        open_paren_idx = clean_code.find('(', start_idx)
+        if open_paren_idx != -1 and open_paren_idx - start_idx < 10:
+            # Walk balanced parentheses to handle nested calls e.g. for(uint i=0; i<max(10, total); i++)
+            paren_depth = 1
+            idx = open_paren_idx + 1
+            length = len(clean_code)
+            while idx < length and paren_depth > 0:
+                if clean_code[idx] == '(':
+                    paren_depth += 1
+                elif clean_code[idx] == ')':
+                    paren_depth -= 1
+                idx += 1
+
+            if paren_depth == 0:
+                # Look ahead past whitespace for opening brace '{'
+                remainder = clean_code[idx:]
+                next_non_space = re.search(r"\S", remainder)
+                if next_non_space and next_non_space.group(0) == '{':
+                    brace_pos = idx + next_non_space.start()
+                    loop_brace_positions.add(brace_pos)
+                else:
+                    has_braceless_loop = True
+
     max_loop_depth = 0
     current_brace_depth = 0
-    active_loop_stack = []  # Stack storing the brace depth at which each active loop started
+    active_loops = []  # Stack of brace depths at which loop braces were opened
 
-    # We can scan character by character to accurately trace brace weights
-    i = 0
-    length = len(clean_code)
-    
-    # Pre-identify loop locations
-    loop_regex = re.compile(r"\b(for|while)\b\s*\([^()]*+(?:\([^()]*+\)[^()]*+)*+\)\s*\{|\b(for|while)\b\s*\(")
-    
-    # Standard character iteration to track braces and loop starts
-    # To handle loops with or without braces, or braces on next lines:
-    lines = clean_code.split('\n')
-    
-    # Alternative robust scanner using regex + character scanning:
-    # Walk character by character
-    i = 0
-    active_loops = []  # list of depth integers where loop brace opened
-    
-    while i < length:
-        ch = clean_code[i]
-        
-        # Check if a loop starts at index i
-        # Match loop pattern: \b(for|while)\b
-        match_loop = re.match(r"\b(for|while)\b", clean_code[i:])
-        if match_loop:
-            # Look ahead for opening brace '{'
-            brace_pos = clean_code.find('{', i + match_loop.end())
-            # Ensure no function or contract keyword comes between loop and '{'
-            intervening = clean_code[i + match_loop.end():brace_pos] if brace_pos != -1 else ""
-            if brace_pos != -1 and not re.search(r"\b(function|contract|struct|enum|event)\b", intervening):
-                # When '{' of this loop is reached, it will open at current_brace_depth + 1
-                # Mark this pending loop opening brace position
-                pending_loop_brace = brace_pos
-            else:
-                pending_loop_brace = -1
-        else:
-            pending_loop_brace = -1
-
+    for i, ch in enumerate(clean_code):
         if ch == '{':
             current_brace_depth += 1
-            # Check if this brace belongs to a loop start
-            # Check if there was a for/while shortly preceding this '{'
-            lookback = clean_code[max(0, i - 200):i]
-            if re.search(r"\b(for|while)\b\s*\(.*?\)\s*$", lookback, re.DOTALL):
+            if i in loop_brace_positions:
                 active_loops.append(current_brace_depth)
                 if len(active_loops) > max_loop_depth:
                     max_loop_depth = len(active_loops)
@@ -106,8 +87,9 @@ def scan_solidity_source_metrics(project_slug: str, asset_identifier: str, sourc
             if active_loops and active_loops[-1] == current_brace_depth:
                 active_loops.pop()
             current_brace_depth = max(0, current_brace_depth - 1)
-            
-        i += 1
+
+    if max_loop_depth == 0 and has_braceless_loop:
+        max_loop_depth = 1
 
     return {
         "project_slug": project_slug,

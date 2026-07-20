@@ -152,7 +152,7 @@ def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
                SUM(state_mutations_count) as total_muts
         FROM ast_metrics GROUP BY project_slug
         """)
-        ast_cache_lookup = {r["project_slug"]: dict(r) for r in cursor.fetchall()}
+        ast_cache_lookup = {str(r["project_slug"]).lower(): dict(r) for r in cursor.fetchall()}
     except Exception:
         ast_cache_lookup = {}
 
