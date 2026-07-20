@@ -141,7 +141,7 @@ def run_verification_tests():
     from core.math_engine import fetch_defillama_tvl_cache
     
     # Test Pass 1: Confirm ATTACH DATABASE routes resolve without throwing OperationalError path exceptions
-    print("[1/7] Test Pass 1: Validating ATTACH DATABASE path resolution...")
+    print("[1/8] Test Pass 1: Validating ATTACH DATABASE path resolution...")
     conn = get_unified_connection()
     try:
         attach_vulnerabilities_db(conn)
@@ -153,7 +153,7 @@ def run_verification_tests():
     seed_empirical_vulnerabilities_data(conn)
 
     # Test Pass 2: Verify cross-database joins executing over vuln return valid numerical counts > 0
-    print("[2/7] Test Pass 2: Verifying cross-database queries over vuln tables return counts > 0...")
+    print("[2/8] Test Pass 2: Verifying cross-database queries over vuln tables return counts > 0...")
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM vuln.normalized_findings")
     total_findings = cursor.fetchone()[0]
@@ -165,7 +165,7 @@ def run_verification_tests():
     print(f"      [OK] Cross-database queries verified (Total findings: {total_findings}, Tag indices: {total_tags}).")
 
     # Test Pass 3: Assert calculated expected_profitability_yield values fluctuate dynamically across target rows
-    print("[3/7] Test Pass 3: Verifying dynamic target profitability matrix yield variance...")
+    print("[3/8] Test Pass 3: Verifying dynamic target profitability matrix yield variance...")
     matrix = get_target_profitability_matrix(conn)
     assert len(matrix) >= 2, f"Expected at least 2 scored targets, got {len(matrix)}"
     
@@ -178,7 +178,7 @@ def run_verification_tests():
     print(f"      [OK] Matrix yield metrics fluctuate dynamically across target rows (Yields: {yields}).")
 
     # Test Pass 4: Cascading Delete & DB Schema Health
-    print("[4/7] Test Pass 4: Verifying foreign key cascading deletes & PRAGMA health...")
+    print("[4/8] Test Pass 4: Verifying foreign key cascading deletes & PRAGMA health...")
     pragma_wal = cursor.execute("PRAGMA journal_mode;").fetchone()[0]
     assert pragma_wal.lower() == "wal", f"Expected WAL mode, got {pragma_wal}"
     
@@ -191,20 +191,20 @@ def run_verification_tests():
     print("      [OK] Foreign key cascading deletes and database PRAGMA integrity verified.")
 
     # Test Pass 5: API Reachability & DeFiLlama Ingestion Client Handshake
-    print("[5/7] Test Pass 5: Validating DeFiLlama live REST client API reachability...")
+    print("[5/8] Test Pass 5: Validating DeFiLlama live REST client API reachability...")
     tvl_cache = fetch_defillama_tvl_cache()
     assert isinstance(tvl_cache, dict), "Expected TVL cache to be a dictionary object"
     assert len(tvl_cache) > 0, "Expected live DeFiLlama TVL cache lookup map to contain entries"
     print(f"      [OK] DeFiLlama REST client successfully ingested live protocols (Mapped keys count: {len(tvl_cache)}).")
 
     # Test Pass 6: Resilience & Dropout Timeout Drop Checking
-    print("[6/7] Test Pass 6: Verifying network error resilience and socket drop timeout handling...")
+    print("[6/8] Test Pass 6: Verifying network error resilience and socket drop timeout handling...")
     fallback_cache = fetch_defillama_tvl_cache(endpoint="http://10.255.255.1:9999/protocols", timeout=1.0)
     assert isinstance(fallback_cache, dict), "Fallback cache must return a valid dictionary on network timeout drop"
     print("      [OK] Network connection timeout intercepted gracefully; engine returned cached/fallback map without crashing.")
 
     # Test Pass 7: Data-Driven Yield Variance & On-Chain TVL Scaling
-    print("[7/7] Test Pass 7: Verifying data-driven yield variance and live TVL reward scaling...")
+    print("[7/8] Test Pass 7: Verifying data-driven yield variance and live TVL reward scaling...")
     live_matrix = get_target_profitability_matrix(conn)
     matrix_by_slug = {r["slug"]: r for r in live_matrix}
     
@@ -221,6 +221,66 @@ def run_verification_tests():
         "Protocols with large active TVL must scale higher effective reward ceilings than smaller assets"
         
     print(f"      [OK] Economic TVL rules confirmed (Aave TVL: ${aave_row['tvl_applied']:,.2f}, Real Reward: ${aave_row['calculated_real_reward']:,.2f}).")
+
+    # Test Pass 8: State Differential Validation
+    print("[8/8] Test Pass 8: Verifying state differential engine, mutation logging, and queue evictions...")
+    from core.tracker import compare_and_apply_project_differential
+    
+    cursor = conn.cursor()
+    with DB_LOCK:
+        with conn:
+            cursor.execute("""
+            INSERT OR REPLACE INTO projects (
+                slug, source_platform, native_id, project_name, description,
+                max_bounty_usd, primacy_model, kyc_required, invite_only, raw_json
+            ) VALUES ('mock-protocol', 'immunefi', 'mock_01', 'Mock Protocol', 'Test Desc', 1000000, 'impact', 0, 0, '{}')
+            """)
+            cursor.execute("DELETE FROM assets WHERE project_slug = 'mock-protocol'")
+            cursor.execute("""
+            INSERT INTO assets (project_slug, asset_identifier, url, type, description, is_safe_harbor)
+            VALUES ('mock-protocol', 'mock_contract_v1.sol', 'https://github.com/mock/v1.sol', 'solidity', 'v1 core', 1)
+            """)
+            
+            cursor.execute("""
+            INSERT INTO preflight_queue (
+                source_pool, source_identifier, request_type, system_prompt_payload, user_prompt_payload,
+                character_count, estimated_tokens, token_bucket_tier, dispatch_status
+            ) VALUES ('immunefi', 'mock-protocol', 'structural_extraction', 'sys', 'usr', 100, 25, 'less_than_1k', 'DISPATCHED')
+            """)
+
+    cursor.execute("SELECT COUNT(*) FROM bounty_state_mutations")
+    initial_mutations_count = cursor.fetchone()[0]
+
+    incoming_proj = {
+        "slug": "mock-protocol",
+        "source_platform": "immunefi",
+        "max_bounty_usd": 2000000,
+        "primacy_model": "impact",
+        "kyc_required": 0,
+        "invite_only": 0
+    }
+    incoming_assets = [
+        {"asset_identifier": "mock_contract_v1.sol", "type": "solidity", "url": "https://github.com/mock/v1.sol"},
+        {"asset_identifier": "mock_contract_v2.sol", "type": "solidity", "url": "https://github.com/mock/v2.sol"}
+    ]
+
+    detected_mutations = compare_and_apply_project_differential(incoming_proj, incoming_assets, conn=conn)
+
+    cursor.execute("SELECT COUNT(*) FROM bounty_state_mutations")
+    final_mutations_count = cursor.fetchone()[0]
+    mutation_delta = final_mutations_count - initial_mutations_count
+
+    assert mutation_delta >= 2, f"Expected scalar mutation count increase >= 2, got delta {mutation_delta}"
+    
+    mutation_types = [m["mutation_type"] for m in detected_mutations]
+    assert "MAX_REWARD_DRIFT" in mutation_types, "Expected MAX_REWARD_DRIFT mutation to be detected"
+    assert "STRUCTURAL_SCOPE_DRIFT" in mutation_types, "Expected STRUCTURAL_SCOPE_DRIFT mutation to be detected"
+
+    cursor.execute("SELECT dispatch_status FROM preflight_queue WHERE source_identifier = 'mock-protocol'")
+    q_row = cursor.fetchone()
+    assert q_row is not None and q_row["dispatch_status"] == "PENDING", f"Expected preflight_queue status revert to 'PENDING', got '{q_row['dispatch_status'] if q_row else None}'"
+
+    print("      [OK] State differential engine, mutation telemetry logging, and queue eviction verified.")
     conn.close()
 
     print("\n[SUCCESS] All stability assertions and empirical integration tests PASSED!")

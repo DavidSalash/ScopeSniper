@@ -24,6 +24,7 @@ from core.pipeline import (
     REFUSAL_GUARD_TEXT
 )
 from core.ingest_source_dbs import run_full_source_ingestion
+from core.tracker import run_state_differential_tracker_loop
 
 CONFIG_FILE = Path(__file__).parent.parent / "config" / "prompt_config.json"
 
@@ -40,6 +41,11 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_db():
     init_unified_db()
+    try:
+        asyncio.create_task(run_state_differential_tracker_loop(interval_seconds=60.0))
+        print("[+] Launched background state-differential tracking loop.")
+    except Exception as e:
+        print(f"[-] Failed to launch background tracking daemon: {e}")
 
 @app.get("/api/ingestion/batch-workspace")
 def get_batch_workspace():
@@ -89,9 +95,15 @@ def get_batch_workspace():
                 "prose_refusal": row["prose_refusal"] or 0,
                 "malformed_json": row["malformed_json"] or 0,
                 "skipped_metadata": row["skipped_metadata"] or 0,
-                "no content": row["no_content"] or 0,
             }
             
+    # Query recent bounty state mutations
+    try:
+        cursor.execute("SELECT * FROM bounty_state_mutations ORDER BY id DESC LIMIT 50")
+        mutation_rows = [dict(row) for row in cursor.fetchall()]
+    except Exception:
+        mutation_rows = []
+
     conn.close()
     
     # Prompt configuration metadata
@@ -115,6 +127,7 @@ def get_batch_workspace():
     return {
         "queue": queue_rows,
         "aggregations": aggs,
+        "mutations": mutation_rows,
         "prompt_config": prompt_config,
         "system_diagnostics": system_diagnostics
     }
@@ -366,6 +379,17 @@ async def event_stream(request: Request):
             pending_cnt = cursor.fetchone()["pending"]
             cursor.execute("SELECT COUNT(*) as dispatched FROM preflight_queue WHERE dispatch_status = 'DISPATCHED'")
             dispatched_cnt = cursor.fetchone()["dispatched"]
+            
+            try:
+                cursor.execute("""
+                SELECT log_message FROM bounty_state_mutations
+                WHERE detected_at >= datetime('now', '-5 seconds')
+                ORDER BY id DESC LIMIT 10
+                """)
+                mut_alerts = [r["log_message"] for r in cursor.fetchall()]
+            except Exception:
+                mut_alerts = []
+                
             conn.close()
             
             telemetry_data = {
@@ -377,7 +401,8 @@ async def event_stream(request: Request):
                 "pending_queue_length": pending_cnt,
                 "completed_dispatches": dispatched_cnt,
                 "cluster_gpu_utilization_pct": 74.5,
-                "vram_allocated_gb": 22.8
+                "vram_allocated_gb": 22.8,
+                "mutation_alerts": mut_alerts
             }
             
             yield f"data: {json.dumps(telemetry_data)}\n\n"

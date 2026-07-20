@@ -155,6 +155,20 @@ def init_unified_db():
             response_payload TEXT
         )""")
 
+        # Differential Mutation Telemetry Table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bounty_state_mutations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_slug TEXT NOT NULL,
+            source_platform TEXT NOT NULL,
+            mutation_type TEXT NOT NULL CHECK (mutation_type IN ('MAX_REWARD_DRIFT', 'STRUCTURAL_SCOPE_DRIFT', 'LEGAL_ACCESS_DRIFT')),
+            field_name TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT,
+            log_message TEXT NOT NULL,
+            detected_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+
         # Performance Indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_proj_platform ON projects (source_platform);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_proj_max_bounty ON projects (max_bounty_usd) WHERE max_bounty_usd IS NOT NULL;")
@@ -162,6 +176,7 @@ def init_unified_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rewards_matrix ON rewards (project_slug, severity_level, max_reward);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_meta_lookup ON project_metadata (meta_key, meta_value);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON preflight_queue (dispatch_status, token_bucket_tier);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mutations_slug ON bounty_state_mutations (project_slug, detected_at);")
 
     print(f"[+] Unified Database initialized at: {DB_FILE}")
 
