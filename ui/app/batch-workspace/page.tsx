@@ -212,7 +212,7 @@ function TargetProfitabilityMatrixView() {
           privilege_tier: "admin"
         }
       ])
-    } finally: {
+    } finally {
       setLoading(false)
     }
   }

@@ -1,8 +1,42 @@
-__pycache__
+# Python
+__pycache__/
 *.pyc
 *.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
 
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+unified_bug_bounties.db
 
+# Node & Next.js
+node_modules/
+ui/node_modules/
+.next/
+ui/.next/
+out/
+build/
+dist/
+
+# Environment & Config
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Scripts & dumps
 extract_code.py
 extract_modified.py
 codebase.txt

@@ -1,7 +1,13 @@
 import time
 import json
 import asyncio
+import sys
 from pathlib import Path
+
+# Add project root to sys.path
+WORKSPACE_DIR = Path(__file__).parent.parent.resolve()
+sys.path.insert(0, str(WORKSPACE_DIR))
+
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, BackgroundTasks, Request, Body, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
