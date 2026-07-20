@@ -141,6 +141,21 @@ def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
     # 4. Fetch live DeFiLlama TVL lookup cache
     tvl_cache = fetch_defillama_tvl_cache()
 
+    # 4b. Pre-compiled Global Cache Lookup for AST Metrics
+    ast_cache_lookup = {}
+    try:
+        cursor.execute("""
+        SELECT project_slug, 
+               SUM(total_functions) as total_funcs,
+               MAX(max_loop_depth) as max_loop,
+               SUM(external_calls_count) as total_calls,
+               SUM(state_mutations_count) as total_muts
+        FROM ast_metrics GROUP BY project_slug
+        """)
+        ast_cache_lookup = {r["project_slug"]: dict(r) for r in cursor.fetchall()}
+    except Exception:
+        ast_cache_lookup = {}
+
     # 5. Query projects joined with rewards aggregation, assets count, and known issues count
     query = """
     SELECT 
@@ -214,8 +229,17 @@ def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
             total_global_findings=total_global_findings
         )
         
-        nesting_depth_modifier = 1.0 + (0.05 * min(10, files_count))
-        t_index = calculate_complexity_time_index(files_count, nesting_depth_modifier, kyc_required)
+        # Fetch pre-compiled AST metric map with fallbacks
+        ast_data = ast_cache_lookup.get(slug, {})
+        total_funcs = ast_data.get("total_funcs") if ast_data.get("total_funcs") is not None else 8
+        max_loop = ast_data.get("max_loop") if ast_data.get("max_loop") is not None else 1
+        total_calls = ast_data.get("total_calls") if ast_data.get("total_calls") is not None else 2
+
+        depth_factor = 1.0 + (0.15 * max_loop)
+        call_factor = 1.0 + (0.02 * total_calls)
+        kyc_mult = 1.5 if kyc_required else 1.0
+
+        t_index = files_count * depth_factor * call_factor * kyc_mult
         
         # Resolve TVL dynamically using tiered lookup rules
         tvl_applied = None

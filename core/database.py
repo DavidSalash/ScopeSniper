@@ -212,7 +212,23 @@ def init_unified_db():
             detected_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
 
+        # AST Metrics Table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ast_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_slug TEXT NOT NULL,
+            asset_identifier TEXT NOT NULL,
+            total_functions INTEGER DEFAULT 0,
+            max_loop_depth INTEGER DEFAULT 0,
+            external_calls_count INTEGER DEFAULT 0,
+            state_mutations_count INTEGER DEFAULT 0,
+            scanned_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_slug) REFERENCES projects(slug) ON DELETE CASCADE,
+            UNIQUE(project_slug, asset_identifier)
+        );""")
+
         # Performance Indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ast_lookup ON ast_metrics (project_slug, asset_identifier);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_proj_platform ON projects (source_platform);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_proj_max_bounty ON projects (max_bounty_usd) WHERE max_bounty_usd IS NOT NULL;")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_assets_slug ON assets (project_slug, type);")
