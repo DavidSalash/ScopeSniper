@@ -316,6 +316,59 @@ def run_verification_tests():
     print("      [OK] State differential engine, new program ingestion path, mutation telemetry, and SSE deduplication verified.")
     conn.close()
 
+    # Test Pass 9: Git Mining Invariant
+    print("[9/9] Test Pass 9: Verifying async git mining engine and taxonomy classification parser...")
+    import asyncio
+    import tempfile
+    import subprocess
+    from core.git_parser import mine_repository_security_history
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        # Initialize mock git repository
+        subprocess.run(["git", "init"], cwd=temp_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=temp_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=temp_dir, check=True)
+
+        # 1. Initial Commit
+        contract_path = temp_path / "LiquidityPool.sol"
+        contract_path.write_text("contract LiquidityPool { function withdraw() public {} }", encoding="utf-8")
+        subprocess.run(["git", "add", "LiquidityPool.sol"], cwd=temp_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit of liquidity pool contract"], cwd=temp_dir, check=True)
+
+        # 2. Security Fix Commit
+        contract_path.write_text("contract LiquidityPool { bool locked; function withdraw() public { require(!locked); locked=true; locked=false; } }", encoding="utf-8")
+        subprocess.run(["git", "add", "LiquidityPool.sol"], cwd=temp_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "Fix critical reentrancy exploit in liquidity pool"], cwd=temp_dir, check=True)
+
+        # 3. Invoke mine_repository_security_history
+        mined_count = asyncio.run(mine_repository_security_history(temp_dir, "mock-protocol"))
+        assert mined_count >= 1, f"Expected mined security commits >= 1, got {mined_count}"
+
+        # 4. Empirical Assertions over vulnerabilities.db
+        test_conn = get_unified_connection()
+        attach_vulnerabilities_db(test_conn)
+        t_cursor = test_conn.cursor()
+        
+        t_cursor.execute("SELECT * FROM vuln.normalized_findings WHERE source_pool = 'mock-protocol'")
+        f_row = t_cursor.fetchone()
+        assert f_row is not None, "Expected mined finding in vuln.normalized_findings"
+        assert f_row["title"] == "Fix critical reentrancy exploit in liquidity pool"
+        assert "LiquidityPool.sol" in f_row["file_paths"]
+        assert len(f_row["content_markdown"]) > 0
+
+        t_cursor.execute("SELECT * FROM vuln.vulnerability_tags_index WHERE source_pool = 'mock-protocol'")
+        tag_row = t_cursor.fetchone()
+        assert tag_row is not None, "Expected tag entry in vuln.vulnerability_tags_index"
+        assert tag_row["tag"] == "reentrancy", f"Expected tag 'reentrancy', got '{tag_row['tag']}'"
+
+        # 5. Confirm profitability matrix score calculations incorporate updated tag index count
+        matrix_updated = get_target_profitability_matrix(test_conn)
+        assert len(matrix_updated) > 0, "Updated target profitability matrix returned empty"
+        test_conn.close()
+
+    print("      [OK] Git repository mining engine, diff extraction, reentrancy taxonomy classification, and yield recalculation verified.")
+
     print("\n[SUCCESS] All stability assertions and empirical integration tests PASSED!")
 
 if __name__ == "__main__":

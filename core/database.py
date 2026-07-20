@@ -15,6 +15,48 @@ def get_unified_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+def get_vulnerabilities_connection():
+    VULNERABILITIES_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(VULNERABILITIES_DB_FILE), timeout=60.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_vulnerabilities_db():
+    conn = get_vulnerabilities_connection()
+    cursor = conn.cursor()
+    with conn:
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS normalized_findings (
+            id TEXT PRIMARY KEY,
+            source_pool TEXT NOT NULL,
+            protocol_name TEXT,
+            title TEXT,
+            content_markdown TEXT,
+            severity TEXT,
+            loss_usd REAL,
+            file_paths TEXT,
+            fix_commit TEXT,
+            root_cause_keywords TEXT,
+            raw_solidity_code TEXT,
+            source_repo TEXT
+        )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_pool ON normalized_findings (source_pool);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_severity ON normalized_findings (severity);")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS vulnerability_tags_index (
+            finding_id TEXT,
+            source_pool TEXT,
+            tag TEXT,
+            PRIMARY KEY(finding_id, tag)
+        )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tag_lookup ON vulnerability_tags_index(tag);")
+    conn.close()
+
 def attach_vulnerabilities_db(conn: sqlite3.Connection) -> None:
     """
     Dynamically mounts the historical vulnerabilities tracking ledger ('vulnerabilities.db')
@@ -22,6 +64,7 @@ def attach_vulnerabilities_db(conn: sqlite3.Connection) -> None:
     Safely intercepts OperationalError if already attached in the active thread connection session.
     Enforces row factory mapping (conn.row_factory = sqlite3.Row).
     """
+    init_vulnerabilities_db()
     conn.row_factory = sqlite3.Row
     resolved_path = str(VULNERABILITIES_DB_FILE).replace("\\", "/")
     try:
