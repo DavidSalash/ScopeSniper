@@ -100,6 +100,9 @@ def scan_solidity_source_metrics(project_slug: str, asset_identifier: str, sourc
         "state_mutations_count": state_mutations_count
     }
 
+import os
+from pathlib import Path
+
 def persist_ast_metrics(project_slug: str, asset_identifier: str, metrics: dict, conn: sqlite3.Connection):
     """
     Persists extracted AST metrics to the database inside DB_LOCK context.
@@ -120,3 +123,69 @@ def persist_ast_metrics(project_slug: str, asset_identifier: str, metrics: dict,
                 metrics.get("external_calls_count", 0),
                 metrics.get("state_mutations_count", 0)
             ))
+
+def run_global_asset_ast_scan(conn: sqlite3.Connection, cache_dir: str = "vulnerability_repos/solidity_cache") -> int:
+    """
+    Orchestrates global source code harvesting and AST metrics parsing for contract assets.
+    Queries unified assets table for solidity/smart_contract types, matches cached source files,
+    runs the AST scanner, and persists metrics into ast_metrics.
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT project_slug, asset_identifier, url, description 
+        FROM assets 
+        WHERE LOWER(type) IN ('solidity', 'smart_contract', 'contract')
+    """)
+    asset_rows = cursor.fetchall()
+
+    cache_path = Path(cache_dir)
+    processed_count = 0
+
+    if not cache_path.exists():
+        return 0
+
+    for row in asset_rows:
+        project_slug = row["project_slug"]
+        asset_identifier = row["asset_identifier"] or ""
+        description = row["description"] or ""
+
+        # Candidates to look for on disk
+        candidates = []
+        if asset_identifier:
+            # e.g., Pool.sol or path/Pool.sol -> Pool.sol, Pool
+            clean_ident = Path(asset_identifier).name
+            candidates.append(clean_ident)
+            candidates.append(asset_identifier)
+
+        if description:
+            clean_desc = Path(description).name
+            candidates.append(clean_desc)
+            candidates.append(description)
+
+        target_file = None
+        for candidate in candidates:
+            if not candidate:
+                continue
+            # Try direct file inside cache_dir
+            candidate_path = cache_path / candidate
+            if candidate_path.is_file():
+                target_file = candidate_path
+                break
+            
+            # Try recursive search if candidate matches filename
+            matched_files = list(cache_path.glob(f"**/{candidate}"))
+            if matched_files and matched_files[0].is_file():
+                target_file = matched_files[0]
+                break
+
+        if target_file and target_file.is_file():
+            try:
+                source_code = target_file.read_text(encoding="utf-8", errors="ignore")
+                metrics = scan_solidity_source_metrics(project_slug, asset_identifier, source_code)
+                persist_ast_metrics(project_slug, asset_identifier, metrics, conn)
+                processed_count += 1
+            except Exception as e:
+                print(f"[!] Error processing asset {asset_identifier} from {target_file}: {e}")
+
+    return processed_count
+

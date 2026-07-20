@@ -81,15 +81,15 @@ def calculate_success_probability(
     p_success = density_ratio * audit_factor
     return max(0.0001, p_success)
 
-def calculate_complexity_time_index(files_count: int, nesting_depth_modifier: float, kyc_required: bool) -> float:
+def calculate_complexity_time_index(files_count: int, max_loop_depth: int, external_calls_count: int, kyc_required: bool) -> float:
     """
     Computes algorithmically from scope properties:
-    T = Files Count * Nesting Depth Modifier * (1.5 if KYC required else 1.0)
+    T = Files Count * Depth Factor * Call Factor * KYC Multiplier
     """
-    base_files = max(1, files_count)
-    depth = max(1.0, nesting_depth_modifier)
+    depth_factor = 1.0 + (0.15 * max_loop_depth)
+    call_factor = 1.0 + (0.02 * external_calls_count)
     kyc_multiplier = 1.5 if kyc_required else 1.0
-    return base_files * depth * kyc_multiplier
+    return max(1, files_count) * depth_factor * call_factor * kyc_multiplier
 
 def calculate_expected_profitability_yield(
     p_success: float,
@@ -235,11 +235,12 @@ def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
         max_loop = ast_data.get("max_loop") if ast_data.get("max_loop") is not None else 1
         total_calls = ast_data.get("total_calls") if ast_data.get("total_calls") is not None else 2
 
-        depth_factor = 1.0 + (0.15 * max_loop)
-        call_factor = 1.0 + (0.02 * total_calls)
-        kyc_mult = 1.5 if kyc_required else 1.0
-
-        t_index = files_count * depth_factor * call_factor * kyc_mult
+        t_index = calculate_complexity_time_index(
+            files_count=files_count,
+            max_loop_depth=max_loop,
+            external_calls_count=total_calls,
+            kyc_required=kyc_required
+        )
         
         # Resolve TVL dynamically using tiered lookup rules
         tvl_applied = None
