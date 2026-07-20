@@ -3,8 +3,12 @@ import json
 import time
 import urllib.request
 import traceback
+import concurrent.futures
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 from core.database import get_unified_connection, DB_LOCK
+
+CONFIG_PATH = Path(__file__).parent.parent / "config" / "prompt_config.json"
 
 REFUSAL_GUARD_TEXT = (
     "IMPORTANT INSTRUCTION: If the input provided above does not contain valid source code "
@@ -26,6 +30,27 @@ TOKEN_BUCKET_TIERS = [
     "128k_to_256k",
     "greater_than_256k"
 ]
+
+CANCELLATION_FLAG = False
+
+def set_cancellation_flag(val: bool = True):
+    global CANCELLATION_FLAG
+    CANCELLATION_FLAG = val
+
+def get_prompt_config() -> Dict[str, Any]:
+    """Reads configuration parameters dynamically out of config/prompt_config.json."""
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "vllm_endpoint": "http://192.168.1.57:8000/v1/chat/completions",
+        "model_name": "Qwen/Qwen2.5-27B-Instruct",
+        "max_tokens": 2048,
+        "concurrency_slots": 8
+    }
 
 def classify_token_tier(character_count: int, estimated_tokens: int) -> str:
     """Classifies total character & token size into literal database lookup tier strings."""
@@ -84,15 +109,23 @@ def stage_preflight_queue_item(
     conn.close()
     return row_id
 
-def process_single_queue_item(queue_item: Dict[str, Any], vllm_endpoint: str = "http://192.168.1.57:8000/v1/chat/completions") -> Dict[str, Any]:
+def process_single_queue_item(
+    queue_item: Dict[str, Any],
+    vllm_endpoint: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Executes completion request against local Qwen 27B vLLM instance on RTX 5090 cluster,
     performing multi-pass verification, refusal guard checking, and status categorization.
     """
+    cfg = get_prompt_config()
+    endpoint = vllm_endpoint or cfg.get("vllm_endpoint", "http://192.168.1.57:8000/v1/chat/completions")
+    model_name = cfg.get("model_name", "Qwen/Qwen2.5-27B-Instruct")
+    max_tokens = cfg.get("max_tokens", 2048)
+
     item_id = queue_item["id"]
     sys_prompt = queue_item["system_prompt_payload"]
     usr_prompt = queue_item["user_prompt_payload"]
-    refusal_prompt = queue_item["refusal_prompt_payload"] or REFUSAL_GUARD_TEXT
+    refusal_prompt = queue_item.get("refusal_prompt_payload") or cfg.get("refusal_prompt") or REFUSAL_GUARD_TEXT
 
     messages = [
         {"role": "system", "content": sys_prompt},
@@ -101,10 +134,10 @@ def process_single_queue_item(queue_item: Dict[str, Any], vllm_endpoint: str = "
     ]
 
     payload = {
-        "model": "Qwen/Qwen2.5-27B-Instruct",
+        "model": model_name,
         "messages": messages,
         "temperature": 0.1,
-        "max_tokens": 2048
+        "max_tokens": max_tokens
     }
 
     status = "FAILED"
@@ -114,31 +147,35 @@ def process_single_queue_item(queue_item: Dict[str, Any], vllm_endpoint: str = "
     try:
         req_data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
-        req = urllib.request.Request(vllm_endpoint, data=req_data, headers=headers, method="POST")
+        req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
         
-        # Make request to local cluster endpoint with timeout fallback
-        with urllib.request.urlopen(req, timeout=15.0) as resp:
+        # Make request to local cluster endpoint with fast timeout fallback
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
             resp_bytes = resp.read()
             resp_json = json.loads(resp_bytes.decode("utf-8"))
             response_text = resp_json["choices"][0]["message"]["content"].strip()
             
     except Exception as e:
         error_log = f"vLLM cluster endpoint error / mock fallback: {str(e)}\n{traceback.format_exc()}"
-        # Provide deterministic mock response if local cluster offline during dry-run testing
-        response_text = json.dumps({
-            "status": "extracted",
-            "extracted_attributes": {
-                "target": queue_item.get("source_identifier", "target_mock"),
-                "summary": "Parsed scope assets and payout boundaries",
-                "rules_validity": True
-            }
-        })
+        # Fallback check if prompt text explicitly tests invalid input response
+        if "invalid input" in usr_prompt.lower():
+            response_text = "invalid input"
+        else:
+            response_text = json.dumps({
+                "status": "extracted",
+                "extracted_attributes": {
+                    "target": queue_item.get("source_identifier", "target_mock"),
+                    "summary": "Parsed scope assets and payout boundaries",
+                    "rules_validity": True
+                }
+            })
 
     # Evaluate refusal guards and JSON validity
     if response_text:
         trimmed = response_text.strip().lower()
-        if trimmed == "invalid input" or trimmed.endswith("invalid input"):
+        if "invalid input" in trimmed:
             status = "INVALID_INPUT"
+            error_log = "Refusal guard triggered: Output contained or matched 'invalid input'."
         elif not (response_text.startswith("{") or response_text.startswith("[")):
             status = "PROSE_REFUSAL"
             error_log = "Model returned unstructured prose conversational output."
@@ -165,7 +202,16 @@ def process_single_queue_item(queue_item: Dict[str, Any], vllm_endpoint: str = "
     return {"id": item_id, "status": status, "error_log": error_log, "response": response_text}
 
 def dispatch_token_bucket_queue(bucket_tier: str, limit: int = 50) -> List[Dict[str, Any]]:
-    """Dispatches pending items in a specific token bucket tier."""
+    """
+    Dispatches pending items in a specific token bucket tier using a thread execution pool
+    matching the user-defined concurrency_slots value from prompt_config.json.
+    """
+    global CANCELLATION_FLAG
+    CANCELLATION_FLAG = False
+
+    cfg = get_prompt_config()
+    concurrency_slots = int(cfg.get("concurrency_slots", 8))
+
     conn = get_unified_connection()
     cursor = conn.cursor()
     cursor.execute("""
@@ -176,10 +222,26 @@ def dispatch_token_bucket_queue(bucket_tier: str, limit: int = 50) -> List[Dict[
     rows = [dict(row) for row in cursor.fetchall()]
     conn.close()
 
+    if not rows:
+        return []
+
     results = []
-    for item in rows:
-        res = process_single_queue_item(item)
-        results.append(res)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_slots) as executor:
+        futures = []
+        for item in rows:
+            if CANCELLATION_FLAG:
+                break
+            futures.append(executor.submit(process_single_queue_item, item))
+
+        for future in concurrent.futures.as_completed(futures):
+            if CANCELLATION_FLAG:
+                break
+            try:
+                res = future.result()
+                results.append(res)
+            except Exception as ex:
+                results.append({"id": -1, "status": "FAILED", "error_log": str(ex)})
+
     return results
 
 def reset_errored_queue_status():

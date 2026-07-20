@@ -1,18 +1,25 @@
 import time
 import json
 import asyncio
-from typing import Dict, Any, List
-from fastapi import FastAPI, BackgroundTasks, Request
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from fastapi import FastAPI, BackgroundTasks, Request, Body, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from core.database import get_unified_connection, init_unified_db
+from core.database import get_unified_connection, init_unified_db, DB_LOCK
 from core.math_engine import get_target_profitability_matrix
 from core.pipeline import (
     TOKEN_BUCKET_TIERS,
     dispatch_token_bucket_queue,
-    reset_errored_queue_status
+    reset_errored_queue_status,
+    classify_token_tier,
+    set_cancellation_flag,
+    REFUSAL_GUARD_TEXT
 )
+from core.ingest_source_dbs import run_full_source_ingestion
+
+CONFIG_FILE = Path(__file__).parent.parent / "config" / "prompt_config.json"
 
 app = FastAPI(title="Unified Bug Bounty Control Room API", version="2.0")
 
@@ -82,26 +89,18 @@ def get_batch_workspace():
     conn.close()
     
     # Prompt configuration metadata
-    prompt_config = {
-        "structural_extraction": {
-            "agent_name": "structural_extractor_qwen27b",
-            "system_prompt": "You are an expert security researcher...",
-            "user_prompt_template": "Extract key program attributes..."
-        },
-        "taxonomy_tagging": {
-            "agent_name": "taxonomy_tagger_qwen27b",
-            "system_prompt": "You are a vulnerability classification engine...",
-            "user_prompt_template": "Categorize technical impacts..."
-        },
-        "refusal_prompt": "IMPORTANT INSTRUCTION: If input invalid respond 'invalid input'...",
-        "max_tokens": 4096,
-        "concurrency_slots": 8
-    }
+    prompt_config = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                prompt_config = json.load(f)
+        except Exception:
+            pass
 
     # Diagnostics mock
     system_diagnostics = {
         "docker": {"connected": True, "active_sandbox_containers": 4},
-        "llm_lock": {"concurrency_limit": 8, "queued_requests": 0},
+        "llm_lock": {"concurrency_limit": prompt_config.get("concurrency_slots", 8), "queued_requests": 0},
         "resources": {"backend_memory_mb": 1420.5, "cpu_percentage": 18.4},
         "swarm_status": {"queued": aggs.get("less_than_1k", {}).get("pending", 0), "running": 2, "paused": 0},
         "log_stats": {"info": 124, "warning": 3, "error": 0}
@@ -113,6 +112,193 @@ def get_batch_workspace():
         "prompt_config": prompt_config,
         "system_diagnostics": system_diagnostics
     }
+
+@app.get("/api/ingestion/prompt-config")
+def get_prompt_config():
+    """Stream and read data fields out of config/prompt_config.json."""
+    if not CONFIG_FILE.exists():
+        raise HTTPException(status_code=404, detail="prompt_config.json not found")
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading prompt config: {str(e)}")
+
+@app.put("/api/ingestion/prompt-config")
+def update_prompt_config(payload: Dict[str, Any] = Body(...)):
+    """Accept and update configurations (max_tokens, concurrency_slots, vllm_endpoint, model_name)."""
+    current_config = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                current_config = json.load(f)
+        except Exception:
+            pass
+
+    for key in ["max_tokens", "concurrency_slots", "vllm_endpoint", "model_name"]:
+        if key in payload:
+            current_config[key] = payload[key]
+
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(current_config, f, indent=2)
+        return {"status": "success", "config": current_config}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating prompt config: {str(e)}")
+
+@app.post("/api/ingestion/compile")
+def compile_source_ingestion(background_tasks: BackgroundTasks):
+    """Launch a background task that executes run_full_source_ingestion() to clear and re-populate preflight_queue."""
+    background_tasks.add_task(run_full_source_ingestion)
+    return {"status": "compilation_started", "message": "Source database ingestion initiated in background."}
+
+@app.post("/api/ingestion/calculate-tokens")
+def calculate_tokens(payload: Optional[Dict[str, Any]] = Body(None)):
+    """Recalculate estimated tokens for target IDs or all rows using a realistic string length estimation helper."""
+    item_ids = payload.get("item_ids") if payload else None
+    
+    conn = get_unified_connection()
+    cursor = conn.cursor()
+    
+    if item_ids:
+        placeholders = ",".join("?" for _ in item_ids)
+        cursor.execute(f"SELECT * FROM preflight_queue WHERE id IN ({placeholders})", item_ids)
+    else:
+        cursor.execute("SELECT * FROM preflight_queue")
+        
+    rows = [dict(r) for r in cursor.fetchall()]
+    updated_count = 0
+    
+    with DB_LOCK:
+        with conn:
+            for row in rows:
+                sys_p = row["system_prompt_payload"] or ""
+                usr_p = row["user_prompt_payload"] or ""
+                ref_p = row["refusal_prompt_payload"] or REFUSAL_GUARD_TEXT
+                char_count = len(sys_p) + len(usr_p) + len(ref_p)
+                est_tokens = char_count // 4
+                tier = classify_token_tier(char_count, est_tokens)
+                
+                cursor.execute("""
+                UPDATE preflight_queue
+                SET character_count = ?, estimated_tokens = ?, token_bucket_tier = ?
+                WHERE id = ?
+                """, (char_count, est_tokens, tier, row["id"]))
+                updated_count += 1
+                
+    conn.close()
+    return {"status": "success", "updated_count": updated_count}
+
+@app.post("/api/ingestion/stop")
+def stop_ingestion():
+    """Provide cancellation control to kill active thread worker execution pools gracefully."""
+    set_cancellation_flag(True)
+    return {"status": "stopped", "message": "Thread worker pool cancellation flag activated."}
+
+@app.post("/api/ingestion/requeue/{item_id}")
+def requeue_item(item_id: int):
+    """Surgically reset a specific ID's status back to 'PENDING' and empty its log column."""
+    conn = get_unified_connection()
+    cursor = conn.cursor()
+    with DB_LOCK:
+        with conn:
+            cursor.execute("""
+            UPDATE preflight_queue
+            SET dispatch_status = 'PENDING', error_log = NULL
+            WHERE id = ?
+            """, (item_id,))
+            affected = cursor.rowcount
+    conn.close()
+    if affected == 0:
+        raise HTTPException(status_code=404, detail=f"Preflight queue item #{item_id} not found.")
+    return {"status": "success", "item_id": item_id, "dispatch_status": "PENDING"}
+
+@app.post("/api/ingestion/requeue-batch")
+def requeue_batch(payload: Dict[str, Any] = Body(...)):
+    """Accept a list of row integers and batch reset them back to 'PENDING'."""
+    item_ids = payload.get("item_ids", [])
+    if not item_ids:
+        return {"status": "success", "requeued_count": 0}
+        
+    conn = get_unified_connection()
+    cursor = conn.cursor()
+    placeholders = ",".join("?" for _ in item_ids)
+    with DB_LOCK:
+        with conn:
+            cursor.execute(f"""
+            UPDATE preflight_queue
+            SET dispatch_status = 'PENDING', error_log = NULL
+            WHERE id IN ({placeholders})
+            """, item_ids)
+            affected = cursor.rowcount
+    conn.close()
+    return {"status": "success", "requeued_count": affected}
+
+@app.post("/api/ingestion/set-pending-batch")
+def set_pending_batch(payload: Dict[str, Any] = Body(...)):
+    """Batch update a list of chosen row IDs to 'PENDING'."""
+    return requeue_batch(payload)
+
+@app.put("/api/ingestion/batch/{item_id}/prompts")
+def update_item_prompts(item_id: int, payload: Dict[str, Any] = Body(...)):
+    """Persist specific manual textual edits made to user or system prompt strings inside the row record before requeuing."""
+    sys_prompt = payload.get("system_prompt")
+    usr_prompt = payload.get("user_prompt")
+    
+    conn = get_unified_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM preflight_queue WHERE id = ?", (item_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Preflight item #{item_id} not found.")
+        
+    current_sys = sys_prompt if sys_prompt is not None else row["system_prompt_payload"]
+    current_usr = usr_prompt if usr_prompt is not None else row["user_prompt_payload"]
+    ref_prompt = row["refusal_prompt_payload"] or REFUSAL_GUARD_TEXT
+    
+    char_count = len(current_sys) + len(current_usr) + len(ref_prompt)
+    est_tokens = char_count // 4
+    tier = classify_token_tier(char_count, est_tokens)
+    
+    with DB_LOCK:
+        with conn:
+            cursor.execute("""
+            UPDATE preflight_queue
+            SET system_prompt_payload = ?,
+                user_prompt_payload = ?,
+                character_count = ?,
+                estimated_tokens = ?,
+                token_bucket_tier = ?,
+                dispatch_status = 'PENDING',
+                error_log = NULL
+            WHERE id = ?
+            """, (current_sys, current_usr, char_count, est_tokens, tier, item_id))
+    conn.close()
+    return {"status": "success", "item_id": item_id, "dispatch_status": "PENDING", "estimated_tokens": est_tokens, "token_bucket_tier": tier}
+
+@app.post("/api/ingestion/export-simplified")
+def export_simplified():
+    """Export standard target asset features down to a clean JSON data dump."""
+    conn = get_unified_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT slug, source_platform, project_name, max_bounty_usd, kyc_required, primacy_model FROM projects")
+    projects = [dict(r) for r in cursor.fetchall()]
+    cursor.execute("SELECT project_slug, asset_identifier, type FROM assets")
+    assets = [dict(r) for r in cursor.fetchall()]
+    cursor.execute("SELECT project_slug, severity_level, min_reward, max_reward, impact_type_normalized FROM rewards")
+    rewards = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    
+    export_payload = {
+        "timestamp": time.time(),
+        "total_projects": len(projects),
+        "projects": projects,
+        "assets": assets,
+        "rewards": rewards
+    }
+    return JSONResponse(content=export_payload)
 
 @app.get("/api/analytics/profitability-matrix")
 def get_profitability_matrix():
@@ -128,7 +314,6 @@ def dispatch_tier(payload: Dict[str, Any], background_tasks: BackgroundTasks):
     bucket_tier = payload.get("bucket_tier", "less_than_1k")
     limit = payload.get("limit", 25)
     
-    # Trigger dispatch background execution
     background_tasks.add_task(dispatch_token_bucket_queue, bucket_tier, limit)
     return {"status": "dispatched", "bucket_tier": bucket_tier, "limit": limit}
 
@@ -141,7 +326,8 @@ def reset_status():
 async def event_stream(request: Request):
     """
     SSE Telemetry Stream sending live metrics:
-    concurrency state properties, moving average inter-token latency (ITL), and time-to-first-token (TTFT).
+    concurrency state properties, moving average inter-token latency (ITL), and time-to-first-token (TTFT),
+    pulling volatile database queue counters dynamically.
     """
     async def generate_telemetry():
         while True:

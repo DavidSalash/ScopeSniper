@@ -14,7 +14,8 @@ from core.pipeline import stage_preflight_queue_item
 def run_full_source_ingestion():
     """
     Reads all projects, assets, rewards, impacts, and metadata from
-    cbb.db, hbb.db, ibb.db, sbb.db and normalizes them into unified_bug_bounties.db.
+    cbb.db, hbb.db, ibb.db, sbb.db and normalizes them into unified_bug_bounties.db,
+    preserving full rule descriptions and supporting cross-platform schema column fallbacks.
     """
     init_unified_db()
     
@@ -61,39 +62,53 @@ def run_full_source_ingestion():
         projects = [dict(r) for r in s_cursor.fetchall()]
 
         for p in projects:
-            slug = str(p.get("slug") or p.get("id") or "").strip()
+            # Flexible fallback data lookups across column names
+            slug = str(p.get("slug") or p.get("id") or p.get("native_id") or "").strip()
             if not slug:
                 continue
 
-            native_id = str(p.get("id") or slug)
-            proj_name = str(p.get("project") or p.get("title") or p.get("name") or slug).strip()
-            desc = p.get("description") or p.get("program_overview") or p.get("main_content") or ""
-            overview = p.get("program_overview") or desc
-            rules = p.get("out_of_scope_and_rules") or ""
-            prioritized = p.get("prioritized_vulnerabilities") or ""
-            web_url = p.get("website_url")
-            github_url = p.get("github_url")
-            logo = p.get("logo") or p.get("logo_url")
-            launch_date = p.get("launch_date")
-            updated_date = p.get("updated_date")
+            native_id = str(p.get("id") or p.get("native_id") or slug)
+            proj_name = str(p.get("project") or p.get("title") or p.get("name") or p.get("project_name") or slug).strip()
+            desc = p.get("description") or p.get("program_overview") or p.get("main_content") or p.get("overview") or ""
+            overview = p.get("program_overview") or p.get("overview") or desc
+            rules = p.get("out_of_scope_and_rules") or p.get("rules") or ""
+            prioritized = p.get("prioritized_vulnerabilities") or p.get("priorities") or ""
+            web_url = p.get("website_url") or p.get("website") or p.get("url")
+            github_url = p.get("github_url") or p.get("github") or p.get("repo_url")
+            logo = p.get("logo") or p.get("logo_url") or p.get("logoUrl") or p.get("image")
+            launch_date = p.get("launch_date") or p.get("created_at")
+            updated_date = p.get("updated_date") or p.get("updated_at")
             end_date = p.get("end_date")
             eval_end_date = p.get("evaluation_end_date")
             
-            # Numeric parsing with fallbacks
+            # Numeric parsing with fallbacks across max_bounty, max_bounty_usd, maxBounty, max_reward
+            max_bounty_raw = (
+                p.get("max_bounty") if p.get("max_bounty") is not None
+                else (p.get("max_bounty_usd") if p.get("max_bounty_usd") is not None
+                else (p.get("maxBounty") if p.get("maxBounty") is not None
+                else p.get("max_reward")))
+            )
             try:
-                max_bounty = int(p.get("max_bounty")) if p.get("max_bounty") is not None else None
+                max_bounty = int(max_bounty_raw) if max_bounty_raw is not None else None
             except (ValueError, TypeError):
                 max_bounty = None
 
+            # Numeric parsing with fallbacks across rewards_pool, rewards_pool_usd, rewardsPool
+            rewards_pool_raw = (
+                p.get("rewards_pool") if p.get("rewards_pool") is not None
+                else (p.get("rewards_pool_usd") if p.get("rewards_pool_usd") is not None
+                else (p.get("rewardsPool") if p.get("rewardsPool") is not None
+                else p.get("pool_usd")))
+            )
             try:
-                rewards_pool = int(p.get("rewards_pool")) if p.get("rewards_pool") is not None else None
+                rewards_pool = int(rewards_pool_raw) if rewards_pool_raw is not None else None
             except (ValueError, TypeError):
                 rewards_pool = None
 
-            rewards_token = p.get("rewards_token") or "USDC"
+            rewards_token = p.get("rewards_token") or p.get("token") or "USDC"
             invite_only = 1 if p.get("invite_only") in (1, "1", True) else 0
             
-            kyc_val = p.get("kyc")
+            kyc_val = p.get("kyc") or p.get("kyc_required")
             if kyc_val in (1, "1", True):
                 kyc_req = 1
                 kyc_type = "light"
@@ -143,10 +158,10 @@ def run_full_source_ingestion():
                 s_cursor.execute("SELECT * FROM assets WHERE project_slug = ?", (slug,))
                 assets = [dict(r) for r in s_cursor.fetchall()]
                 for a in assets:
-                    identifier = a.get("asset_identifier") or a.get("url") or a.get("id") or "Asset"
-                    a_url = a.get("url")
-                    a_type = a.get("type") or "contract"
-                    a_desc = a.get("description")
+                    identifier = a.get("asset_identifier") or a.get("url") or a.get("id") or a.get("target") or "Asset"
+                    a_url = a.get("url") or a.get("target_url")
+                    a_type = a.get("type") or a.get("asset_type") or "contract"
+                    a_desc = a.get("description") or a.get("scope_description")
                     safe_harbor = 1 if a.get("is_safe_harbor") in (1, "1", True) else 0
 
                     with DB_LOCK:
@@ -162,7 +177,7 @@ def run_full_source_ingestion():
                 s_cursor.execute("SELECT * FROM rewards WHERE project_slug = ?", (slug,))
                 rewards = [dict(r) for r in s_cursor.fetchall()]
                 for r in rewards:
-                    severity = str(r.get("severity") or r.get("level") or "high").lower()
+                    severity = str(r.get("severity") or r.get("severity_level") or r.get("level") or "high").lower()
                     payout_desc = r.get("payout") or r.get("payout_description") or f"{severity.title()} Reward"
                     
                     try:
@@ -171,7 +186,8 @@ def run_full_source_ingestion():
                         r_min = 0
 
                     try:
-                        r_max = int(r.get("max_reward")) if r.get("max_reward") is not None else max_bounty or 0
+                        r_max_raw = r.get("max_reward") if r.get("max_reward") is not None else (r.get("max_bounty") if r.get("max_bounty") is not None else max_bounty)
+                        r_max = int(r_max_raw) if r_max_raw is not None else (max_bounty or 0)
                     except (ValueError, TypeError):
                         r_max = max_bounty or 0
 
@@ -194,14 +210,14 @@ def run_full_source_ingestion():
                             ))
                     total_rewards += 1
 
-            # Enqueue preflight queue items for structured LLM parsing
+            # Enqueue preflight queue items for structured LLM parsing (full un-truncated description)
             if len(desc) > 50:
                 stage_preflight_queue_item(
                     source_pool=platform_name,
                     source_identifier=slug,
                     request_type="structural_extraction",
                     system_prompt="You are an expert security researcher and smart contract audit parser.",
-                    user_prompt=f"Extract structured parameters for project {proj_name}:\n\n{desc[:1500]}"
+                    user_prompt=f"Extract structured parameters for project {proj_name}:\n\n{desc}"
                 )
                 total_queued += 1
 
