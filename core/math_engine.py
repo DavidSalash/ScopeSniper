@@ -1,0 +1,130 @@
+import math
+from typing import Dict, List, Any
+
+def calculate_success_probability(audits_count: int) -> float:
+    """
+    Computes statistical probability index based on historical flaw density/audit counts:
+    P_success = 1 / (1 + ln(1 + Audits Count))
+    """
+    safe_audits = max(0, audits_count)
+    return 1.0 / (1.0 + math.log(1.0 + safe_audits))
+
+def calculate_complexity_time_index(files_count: int, nesting_depth_modifier: float, kyc_required: bool) -> float:
+    """
+    Computes algorithmically from scope properties:
+    T = Files Count * Nesting Depth Modifier * (1.5 if KYC required else 1.0)
+    """
+    base_files = max(1, files_count)
+    depth = max(1.0, nesting_depth_modifier)
+    kyc_multiplier = 1.5 if kyc_required else 1.0
+    return base_files * depth * kyc_multiplier
+
+def calculate_expected_profitability_yield(
+    p_success: float,
+    r_max: float,
+    alpha: float,
+    tvl: float,
+    c_time: float,
+    t_index: float
+) -> float:
+    """
+    Computes yield formula:
+    E(P) = P_success * min(R_max, alpha * TVL) - (C_time * T)
+    """
+    economic_cap = alpha * tvl if alpha is not None and alpha > 0 else tvl
+    clamped_reward = min(r_max, economic_cap)
+    expected_gain = p_success * clamped_reward
+    opportunity_cost = c_time * t_index
+    return expected_gain - opportunity_cost
+
+def get_target_profitability_matrix(conn) -> List[Dict[str, Any]]:
+    """
+    Fetches target programs, calculates mathematical profitability metrics,
+    and returns a sorted list of records matching the ProfitabilityRow schema.
+    """
+    cursor = conn.cursor()
+    
+    # Query projects joined with rewards aggregation and assets counts
+    query = """
+    SELECT 
+        p.slug,
+        p.project_name,
+        p.source_platform,
+        p.max_bounty_usd,
+        p.primacy_model,
+        p.scaling_percentage,
+        p.kyc_required,
+        COALESCE(r_agg.max_reward, p.max_bounty_usd, 0) as calculated_max_reward,
+        COALESCE(r_agg.privilege_tier, 'unprivileged') as privilege_tier,
+        COALESCE(r_agg.impact_type_normalized, 'Smart Contract Exploit') as normalized_impact,
+        COALESCE(a_agg.asset_count, 5) as files_count
+    FROM projects p
+    LEFT JOIN (
+        SELECT 
+            project_slug, 
+            MAX(max_reward) as max_reward,
+            privilege_escalation_tier as privilege_tier,
+            impact_type_normalized
+        FROM rewards
+        GROUP BY project_slug
+    ) r_agg ON p.slug = r_agg.project_slug
+    LEFT JOIN (
+        SELECT project_slug, COUNT(*) as asset_count
+        FROM assets
+        GROUP BY project_slug
+    ) a_agg ON p.slug = a_agg.project_slug
+    """
+    
+    rows = cursor.execute(query).fetchall()
+    matrix = []
+    
+    # Default environmental parameters
+    DEFAULT_TVL = 15_000_000.0
+    DEFAULT_C_TIME = 150.0 # $150/hr
+    DEFAULT_AUDITS = 2
+    
+    for row in rows:
+        slug = row["slug"]
+        project_name = row["project_name"]
+        source_platform = row["source_platform"]
+        stated_max_reward = float(row["max_bounty_usd"] or row["calculated_max_reward"] or 0)
+        scaling_pct = row["scaling_percentage"]
+        alpha = (float(scaling_pct) / 100.0) if scaling_pct is not None and scaling_pct > 0 else 1.0
+        kyc_required = bool(row["kyc_required"])
+        primacy_model = row["primacy_model"] if row["primacy_model"] in ['impact', 'rules', 'mixed'] else 'rules'
+        privilege_tier = row["privilege_tier"] if row["privilege_tier"] in ['unprivileged', 'moderator', 'admin', 'trusted_multisig'] else 'unprivileged'
+        normalized_impact = row["normalized_impact"] or "Critical Logic Defect"
+        
+        # Calculate parameters
+        p_success = calculate_success_probability(audits_count=DEFAULT_AUDITS)
+        nesting_depth = 1.2
+        files_count = int(row["files_count"] or 5)
+        t_index = calculate_complexity_time_index(files_count, nesting_depth, kyc_required)
+        
+        clamped_real_reward = min(stated_max_reward, alpha * DEFAULT_TVL)
+        yield_val = calculate_expected_profitability_yield(
+            p_success=p_success,
+            r_max=stated_max_reward,
+            alpha=alpha,
+            tvl=DEFAULT_TVL,
+            c_time=DEFAULT_C_TIME,
+            t_index=t_index
+        )
+        
+        matrix.append({
+            "slug": slug,
+            "project_name": project_name,
+            "source_platform": source_platform,
+            "normalized_impact": normalized_impact,
+            "stated_max_reward": stated_max_reward,
+            "calculated_real_reward": clamped_real_reward,
+            "tvl_applied": DEFAULT_TVL,
+            "complexity_time_cost": DEFAULT_C_TIME * t_index,
+            "success_probability": round(p_success, 4),
+            "expected_profitability_yield": round(yield_val, 2),
+            "primacy_model": primacy_model,
+            "privilege_tier": privilege_tier
+        })
+        
+    matrix.sort(key=lambda x: x["expected_profitability_yield"], reverse=True)
+    return matrix

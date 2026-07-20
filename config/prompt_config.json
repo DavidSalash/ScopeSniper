@@ -1,0 +1,29 @@
+{
+  "structural_extraction": {
+    "agent_name": "structural_extractor_qwen27b",
+    "system_prompt": "You are an expert security researcher and smart contract audit data parser. Your objective is to extract structured JSON metadata from bug bounty program documentation and technical audit briefs.",
+    "user_prompt_template": "Extract key program attributes including platform, rules, scope, severity bounds, and impact definitions from the following raw bug bounty document:\n\n{raw_markdown}"
+  },
+  "taxonomy_tagging": {
+    "agent_name": "taxonomy_tagger_qwen27b",
+    "system_prompt": "You are a vulnerability classification engine. Tag and categorize target scope assets, vulnerability classes, and reward constraints into standardized formats.",
+    "user_prompt_template": "Categorize the technical impacts and scope parameters for the target:\n\n{raw_markdown}"
+  },
+  "refusal_prompt": "IMPORTANT INSTRUCTION: If the input provided above does not contain valid source code or relevant data for your analysis task, or if you cannot extract the requested information because it is simply not present in the input, respond with exactly the words 'invalid input' at the end of your response. Do not attempt to fabricate, hallucinate, or infer information that is not present in the input.",
+  "max_tokens": 4096,
+  "concurrency_slots": 8,
+  "vllm_endpoint": "http://192.168.1.57:8000/v1/chat/completions",
+  "model_name": "Qwen/Qwen2.5-27B-Instruct",
+  "token_bucket_tiers": [
+    "less_than_1k",
+    "1k_to_2k",
+    "2k_to_4k",
+    "4k_to_8k",
+    "8k_to_16k",
+    "16k_to_32k",
+    "32k_to_64k",
+    "64k_to_128k",
+    "128k_to_256k",
+    "greater_than_256k"
+  ]
+}

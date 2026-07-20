@@ -1,0 +1,149 @@
+import sqlite3
+import threading
+from pathlib import Path
+
+DB_LOCK = threading.Lock()
+DB_FILE = Path("/app/data_store/unified_bug_bounties.db") if Path("/app").exists() else Path("C:/users/david/unified_bug_bounties.db")
+
+def get_unified_connection():
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_FILE), timeout=60.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_unified_db():
+    conn = get_unified_connection()
+    cursor = conn.cursor()
+    with conn:
+        # Master Program Table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            slug TEXT PRIMARY KEY,
+            source_platform TEXT NOT NULL CHECK (source_platform IN ('cantina', 'hackenproof', 'immunefi', 'sherlock')),
+            native_id TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            description TEXT,
+            program_overview TEXT,
+            out_of_scope_and_rules TEXT,
+            prioritized_vulnerabilities TEXT,
+            website_url TEXT,
+            github_url TEXT,
+            logo_url TEXT,
+            launch_date TEXT,
+            updated_date TEXT,
+            end_date TEXT,
+            evaluation_end_date TEXT,
+            max_bounty_usd INTEGER,
+            rewards_pool INTEGER,
+            rewards_token TEXT,
+            invite_only INTEGER DEFAULT 0 CHECK (invite_only IN (0, 1)),
+            kyc_required INTEGER DEFAULT 0 CHECK (kyc_required IN (0, 1)),
+            kyc_type TEXT DEFAULT 'none' CHECK (kyc_type IN ('none', 'light', 'full_aml')),
+            immunefi_standard INTEGER DEFAULT 0 CHECK (immunefi_standard IN (0, 1)),
+            primacy_model TEXT DEFAULT 'rules' CHECK (primacy_model IN ('impact', 'rules', 'mixed')),
+            scaling_percentage REAL,
+            scaling_base_metric TEXT,
+            exploit_window_seconds INTEGER DEFAULT 3600,
+            known_issue_assurance INTEGER DEFAULT 0 CHECK (known_issue_assurance IN (0, 1)),
+            raw_json TEXT NOT NULL
+        )""")
+
+        # Targets Boundary Assets
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS assets (
+            row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_slug TEXT NOT NULL,
+            asset_identifier TEXT,
+            url TEXT,
+            type TEXT NOT NULL,
+            description TEXT,
+            is_safe_harbor INTEGER CHECK (is_safe_harbor IN (0, 1, NULL)),
+            FOREIGN KEY (project_slug) REFERENCES projects (slug) ON DELETE CASCADE
+        )""")
+
+        # Standardized Severity Matrix & Reward Constraints
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS rewards (
+            row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_slug TEXT NOT NULL,
+            severity_level TEXT NOT NULL,
+            payout_description TEXT,
+            asset_group_scope TEXT,
+            min_reward INTEGER,
+            max_reward INTEGER,
+            poc_required INTEGER CHECK (poc_required IN (0, 1, NULL)),
+            reward_model TEXT,
+            impact_type_normalized TEXT,
+            min_loss_threshold_usd INTEGER DEFAULT 0,
+            min_freeze_duration_seconds INTEGER DEFAULT 0,
+            privilege_escalation_tier TEXT DEFAULT 'unprivileged' CHECK (privilege_escalation_tier IN ('unprivileged', 'moderator', 'admin', 'trusted_multisig')),
+            FOREIGN KEY (project_slug) REFERENCES projects (slug) ON DELETE CASCADE
+        )""")
+
+        # Auxiliary Meta Tables
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS impacts (
+            row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_slug TEXT NOT NULL,
+            native_id TEXT,
+            type TEXT,
+            severity TEXT,
+            title TEXT,
+            FOREIGN KEY (project_slug) REFERENCES projects (slug) ON DELETE CASCADE
+        )""")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS known_issues (
+            row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_slug TEXT NOT NULL,
+            native_id TEXT,
+            link TEXT,
+            description TEXT,
+            last_updated_at TEXT,
+            related_impact_in_scope TEXT,
+            FOREIGN KEY (project_slug) REFERENCES projects (slug) ON DELETE CASCADE
+        )""")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS project_metadata (
+            row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_slug TEXT NOT NULL,
+            meta_key TEXT NOT NULL,
+            meta_value TEXT NOT NULL,
+            FOREIGN KEY (project_slug) REFERENCES projects (slug) ON DELETE CASCADE,
+            UNIQUE(project_slug, meta_key, meta_value)
+        )""")
+
+        # Context Window Staging Queue for RTX 5090 Cluster Autopilot
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS preflight_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_pool TEXT NOT NULL,
+            source_identifier TEXT NOT NULL,
+            request_type TEXT NOT NULL,
+            system_prompt_payload TEXT NOT NULL,
+            user_prompt_payload TEXT NOT NULL,
+            refusal_prompt_payload TEXT,
+            character_count INTEGER NOT NULL,
+            estimated_tokens INTEGER NOT NULL,
+            token_bucket_tier TEXT NOT NULL,
+            dispatch_status TEXT DEFAULT 'PENDING' CHECK (dispatch_status IN ('PENDING', 'RUNNING', 'DISPATCHED', 'FAILED', 'INVALID', 'INVALID_INPUT', 'PROSE_REFUSAL', 'MALFORMED_JSON', 'SKIPPED_METADATA', 'NO CONTENT')),
+            error_log TEXT,
+            response_payload TEXT
+        )""")
+
+        # Performance Indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_proj_platform ON projects (source_platform);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_proj_max_bounty ON projects (max_bounty_usd) WHERE max_bounty_usd IS NOT NULL;")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_assets_slug ON assets (project_slug, type);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_rewards_matrix ON rewards (project_slug, severity_level, max_reward);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_meta_lookup ON project_metadata (meta_key, meta_value);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON preflight_queue (dispatch_status, token_bucket_tier);")
+
+    print(f"[+] Unified Database initialized at: {DB_FILE}")
+
+if __name__ == "__main__":
+    init_unified_db()
