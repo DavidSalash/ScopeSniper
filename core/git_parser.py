@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 from core.database import get_vulnerabilities_connection, init_vulnerabilities_db, DB_LOCK
+from core.pipeline import get_prompt_config
 
 SECURITY_PATCH_PATTERN = r"(?i)(fix|bug|vuln|security|exploit|bypass|leak|overflow|reentrancy|attack|patch)"
 TARGET_EXTENSIONS = (".sol", ".vy", ".rs")
@@ -64,12 +65,15 @@ def classify_tag_heuristic(commit_msg: str, diff_text: str) -> str:
 
 async def classify_with_llm(raw_diff_text: str, commit_msg: str) -> str:
     """
-    Sends contract diff and commit details to Qwen 27B LLM cluster instance.
+    Sends contract diff and commit details to LLM cluster instance.
     Falls back gracefully to deterministic heuristic on timeout or network drop.
     """
-    url = "http://192.168.1.57:8000/v1/chat/completions"
+    cfg = get_prompt_config()
+    model_name = cfg.get("model_name", "nvidia/Qwen3.6-27B-NVFP4")
+
+    url = cfg.get("vllm_endpoint", "http://192.168.1.57:8000/v1/chat/completions")
     prompt_payload = {
-        "model": "Qwen/Qwen2.5-27B-Instruct",
+        "model": model_name,
         "messages": [
             {
                 "role": "system",

@@ -47,7 +47,7 @@ def get_prompt_config() -> Dict[str, Any]:
             pass
     return {
         "vllm_endpoint": "http://192.168.1.57:8000/v1/chat/completions",
-        "model_name": "Qwen/Qwen2.5-27B-Instruct",
+        "model_name": "nvidia/Qwen3.6-27B-NVFP4",
         "max_tokens": 2048,
         "concurrency_slots": 8
     }
@@ -120,7 +120,7 @@ def process_single_queue_item(
     """
     cfg = get_prompt_config()
     endpoint = vllm_endpoint or cfg.get("vllm_endpoint", "http://192.168.1.57:8000/v1/chat/completions")
-    model_name = cfg.get("model_name", "Qwen/Qwen2.5-27B-Instruct")
+    model_name = cfg.get("model_name", "nvidia/Qwen3.6-27B-NVFP4")
     max_tokens = cfg.get("max_tokens", 2048)
 
     item_id = queue_item["id"]
