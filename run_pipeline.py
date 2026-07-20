@@ -280,7 +280,40 @@ def run_verification_tests():
     q_row = cursor.fetchone()
     assert q_row is not None and q_row["dispatch_status"] == "PENDING", f"Expected preflight_queue status revert to 'PENDING', got '{q_row['dispatch_status'] if q_row else None}'"
 
-    print("      [OK] State differential engine, mutation telemetry logging, and queue eviction verified.")
+    # Fresh Unrecognized Program Discovery Validation
+    new_proj = {
+        "slug": "unrecognized-fresh-protocol",
+        "source_platform": "cantina",
+        "project_name": "Unrecognized Fresh Protocol",
+        "max_bounty_usd": 750000,
+        "primacy_model": "impact",
+        "kyc_required": 0,
+        "invite_only": 0
+    }
+    new_assets = [
+        {"asset_identifier": "FreshVault.sol", "type": "solidity", "url": "https://github.com/fresh/FreshVault.sol"}
+    ]
+    new_proj_mutations = compare_and_apply_project_differential(new_proj, new_assets, conn=conn)
+    assert len(new_proj_mutations) == 0, "New program discovery should bypass mutation logging and return empty mutations list"
+
+    cursor.execute("SELECT * FROM projects WHERE slug = 'unrecognized-fresh-protocol'")
+    fresh_p_row = cursor.fetchone()
+    assert fresh_p_row is not None and fresh_p_row["max_bounty_usd"] == 750000, "Unrecognized project was not safely inserted into projects table"
+
+    cursor.execute("SELECT * FROM assets WHERE project_slug = 'unrecognized-fresh-protocol'")
+    fresh_a_rows = cursor.fetchall()
+    assert len(fresh_a_rows) == 1 and fresh_a_rows[0]["asset_identifier"] == "FreshVault.sol", "Unrecognized project asset was not safely inserted into assets table"
+
+    # Stateful SSE Query Deduplication Check
+    cursor.execute("SELECT id, log_message FROM bounty_state_mutations WHERE id > 0 ORDER BY id ASC LIMIT 10")
+    sse_pass1 = cursor.fetchall()
+    max_id_pass1 = max(r["id"] for r in sse_pass1) if sse_pass1 else 0
+
+    cursor.execute("SELECT id, log_message FROM bounty_state_mutations WHERE id > ? ORDER BY id ASC LIMIT 10", (max_id_pass1,))
+    sse_pass2 = cursor.fetchall()
+    assert len(sse_pass2) == 0, "Stateful SSE query returned duplicate mutation feeds on subsequent pass"
+
+    print("      [OK] State differential engine, new program ingestion path, mutation telemetry, and SSE deduplication verified.")
     conn.close()
 
     print("\n[SUCCESS] All stability assertions and empirical integration tests PASSED!")

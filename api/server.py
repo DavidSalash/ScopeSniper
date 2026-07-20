@@ -95,6 +95,7 @@ def get_batch_workspace():
                 "prose_refusal": row["prose_refusal"] or 0,
                 "malformed_json": row["malformed_json"] or 0,
                 "skipped_metadata": row["skipped_metadata"] or 0,
+                "no content": row["no_content"] or 0,
             }
             
     # Query recent bounty state mutations
@@ -369,6 +370,7 @@ async def event_stream(request: Request):
     pulling volatile database queue counters dynamically.
     """
     async def generate_telemetry():
+        last_seen_mutation_id = 0
         while True:
             if await request.is_disconnected():
                 break
@@ -382,11 +384,14 @@ async def event_stream(request: Request):
             
             try:
                 cursor.execute("""
-                SELECT log_message FROM bounty_state_mutations
-                WHERE detected_at >= datetime('now', '-5 seconds')
-                ORDER BY id DESC LIMIT 10
-                """)
-                mut_alerts = [r["log_message"] for r in cursor.fetchall()]
+                SELECT id, log_message FROM bounty_state_mutations
+                WHERE id > ?
+                ORDER BY id ASC LIMIT 10
+                """, (last_seen_mutation_id,))
+                mut_rows = [dict(r) for r in cursor.fetchall()]
+                mut_alerts = [r["log_message"] for r in mut_rows]
+                if mut_rows:
+                    last_seen_mutation_id = max(r["id"] for r in mut_rows)
             except Exception:
                 mut_alerts = []
                 

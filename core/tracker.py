@@ -48,6 +48,65 @@ def compare_and_apply_project_differential(incoming_project: dict, incoming_asse
     db_proj_row = cursor.fetchone()
     db_proj = dict(db_proj_row) if db_proj_row else None
 
+    # Handle New Program Discovery
+    if not db_proj:
+        with DB_LOCK:
+            with conn:
+                native_id = str(incoming_project.get("native_id") or incoming_project.get("id") or slug)
+                proj_name = str(incoming_project.get("project_name") or incoming_project.get("project") or incoming_project.get("name") or slug).strip()
+                desc = incoming_project.get("description") or incoming_project.get("program_overview") or ""
+                overview = incoming_project.get("program_overview") or desc
+                rules = incoming_project.get("out_of_scope_and_rules") or incoming_project.get("rules") or ""
+                prioritized = incoming_project.get("prioritized_vulnerabilities") or ""
+                web_url = incoming_project.get("website_url") or incoming_project.get("website")
+                github_url = incoming_project.get("github_url") or incoming_project.get("github")
+                logo = incoming_project.get("logo_url") or incoming_project.get("logo")
+                p_max = safe_int(incoming_project.get("max_bounty_usd") if incoming_project.get("max_bounty_usd") is not None else incoming_project.get("max_bounty"))
+                rewards_pool = safe_int(incoming_project.get("rewards_pool"))
+                rewards_token = incoming_project.get("rewards_token") or "USDC"
+                invite_only = safe_int(incoming_project.get("invite_only")) or 0
+                kyc_req = safe_int(incoming_project.get("kyc_required")) or 0
+                kyc_type = incoming_project.get("kyc_type") or ("light" if kyc_req else "none")
+                immunefi_std = safe_int(incoming_project.get("immunefi_standard")) or 0
+                primacy_model = incoming_project.get("primacy_model") or "impact"
+                scaling_pct = incoming_project.get("scaling_percentage") or 10.0
+                raw_json_str = incoming_project.get("raw_json") or json.dumps(incoming_project, default=str)
+
+                cursor.execute("""
+                INSERT OR REPLACE INTO projects (
+                    slug, source_platform, native_id, project_name, description, program_overview,
+                    out_of_scope_and_rules, prioritized_vulnerabilities, website_url, github_url,
+                    logo_url, launch_date, updated_date, end_date, evaluation_end_date,
+                    max_bounty_usd, rewards_pool, rewards_token, invite_only, kyc_required,
+                    kyc_type, immunefi_standard, primacy_model, scaling_percentage, scaling_base_metric,
+                    exploit_window_seconds, known_issue_assurance, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    slug, platform, native_id, proj_name, desc, overview,
+                    rules, prioritized, web_url, github_url,
+                    logo, incoming_project.get("launch_date"), incoming_project.get("updated_date"), incoming_project.get("end_date"), incoming_project.get("evaluation_end_date"),
+                    p_max, rewards_pool, rewards_token, invite_only, kyc_req,
+                    kyc_type, immunefi_std, primacy_model, scaling_pct, "TVL",
+                    3600, 0, raw_json_str
+                ))
+
+                cursor.execute("DELETE FROM assets WHERE project_slug = ?", (slug,))
+                for a in incoming_assets:
+                    identifier = a.get("asset_identifier") or a.get("identifier") or a.get("url") or "Asset"
+                    a_url = a.get("url")
+                    a_type = a.get("type") or a.get("asset_type") or "contract"
+                    a_desc = a.get("description") or a.get("scope_description")
+                    safe_harbor = 1 if a.get("is_safe_harbor") in (1, "1", True) else 0
+                    cursor.execute("""
+                    INSERT INTO assets (project_slug, asset_identifier, url, type, description, is_safe_harbor)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """, (slug, identifier, a_url, a_type, a_desc, safe_harbor))
+
+        print(f"[+] Direct Insertion: Registered new program discovery '{slug}' ({platform}) into projects & assets.")
+        if should_close_conn:
+            conn.close()
+        return []
+
     mutations = []
 
     if db_proj:
