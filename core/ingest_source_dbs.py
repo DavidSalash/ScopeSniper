@@ -153,6 +153,12 @@ def run_full_source_ingestion():
 
             total_ingested += 1
 
+            # Enforce relational integrity: wipe existing child records prior to nested ingestion
+            with DB_LOCK:
+                with unified_conn:
+                    u_cursor.execute("DELETE FROM assets WHERE project_slug = ?", (slug,))
+                    u_cursor.execute("DELETE FROM rewards WHERE project_slug = ?", (slug,))
+
             # Ingest child assets if present
             if "assets" in s_tables:
                 s_cursor.execute("SELECT * FROM assets WHERE project_slug = ?", (slug,))

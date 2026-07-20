@@ -91,7 +91,7 @@ def test_pipeline_execution():
     conn.close()
 
     for item in rows:
-        res = process_single_queue_item(item)
+        res = process_single_queue_item(item, timeout=1.0)
         print(f"[+] Processed preflight queue item #{res['id']} -> Status: {res['status']}")
 
 def run_verification_tests():

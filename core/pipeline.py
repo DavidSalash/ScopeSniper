@@ -111,7 +111,8 @@ def stage_preflight_queue_item(
 
 def process_single_queue_item(
     queue_item: Dict[str, Any],
-    vllm_endpoint: Optional[str] = None
+    vllm_endpoint: Optional[str] = None,
+    timeout: float = 90.0
 ) -> Dict[str, Any]:
     """
     Executes completion request against local Qwen 27B vLLM instance on RTX 5090 cluster,
@@ -149,8 +150,8 @@ def process_single_queue_item(
         headers = {"Content-Type": "application/json"}
         req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
         
-        # Make request to local cluster endpoint with fast timeout fallback
-        with urllib.request.urlopen(req, timeout=2.0) as resp:
+        # Provide an extended boundary to handle processing delays on large context sizes
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             resp_bytes = resp.read()
             resp_json = json.loads(resp_bytes.decode("utf-8"))
             response_text = resp_json["choices"][0]["message"]["content"].strip()
