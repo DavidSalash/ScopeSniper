@@ -442,64 +442,7 @@ function TargetProfitabilityMatrixView() {
       }
     } catch (e) {
       console.error("Failed to fetch profitability matrix:", e)
-      setRows([
-        {
-          slug: "aave-v3",
-          project_name: "Aave V3 Protocol",
-          source_platform: "immunefi",
-          normalized_impact: "Direct Theft of User Deposits",
-          stated_max_reward: 1000000,
-          calculated_real_reward: 1000000,
-          tvl_applied: 15000000,
-          complexity_time_cost: 1350,
-          success_probability: 0.477,
-          expected_profitability_yield: 475650.0,
-          primacy_model: "impact",
-          privilege_tier: "unprivileged"
-        },
-        {
-          slug: "morpho-blue",
-          project_name: "Morpho Blue Core",
-          source_platform: "cantina",
-          normalized_impact: "Protocol Insolvency / Logic Flaw",
-          stated_max_reward: 500000,
-          calculated_real_reward: 500000,
-          tvl_applied: 15000000,
-          complexity_time_cost: 900,
-          success_probability: 0.521,
-          expected_profitability_yield: 259600.0,
-          primacy_model: "impact",
-          privilege_tier: "unprivileged"
-        },
-        {
-          slug: "sherlock-vaults",
-          project_name: "Sherlock Staking Pool",
-          source_platform: "sherlock",
-          normalized_impact: "Yield Manipulation / Drain",
-          stated_max_reward: 250000,
-          calculated_real_reward: 250000,
-          tvl_applied: 15000000,
-          complexity_time_cost: 1125,
-          success_probability: 0.612,
-          expected_profitability_yield: 151875.0,
-          primacy_model: "rules",
-          privilege_tier: "moderator"
-        },
-        {
-          slug: "hackenproof-dex",
-          project_name: "HackenProof MultiDEX",
-          source_platform: "hackenproof",
-          normalized_impact: "Unsafe Token Drain",
-          stated_max_reward: 100000,
-          calculated_real_reward: 100000,
-          tvl_applied: 15000000,
-          complexity_time_cost: 675,
-          success_probability: 0.721,
-          expected_profitability_yield: 71425.0,
-          primacy_model: "mixed",
-          privilege_tier: "admin"
-        }
-      ])
+      setRows([])
     } finally {
       setLoading(false)
     }
