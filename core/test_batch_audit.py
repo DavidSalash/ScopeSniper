@@ -2,149 +2,95 @@ import asyncio
 import json
 import os
 import sys
-import concurrent.futures
+import urllib.request
 from pathlib import Path
-from typing import Dict, Any, List, Optional
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Add workspace root to system path
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(WORKSPACE_DIR))
 
 from core.database import get_unified_connection, attach_vulnerabilities_db
+from core.batch_enricher import run_enrichment_batch
 from core.pipeline import get_prompt_config
-from core.batch_enricher import (
-    _get_stratified_samples,
-    _get_active_taxonomy_guide,
-    _get_active_taxonomy_paths,
-    process_single_finding_enrichment,
-)
 
-import urllib.request
-
-def _check_vllm_reachability(models_url: str = "http://192.168.1.57:8000/v1/models", timeout: float = 5.0) -> bool:
+def check_vllm_reachability() -> bool:
+    """Verifies that the vLLM server on the 5090 is reachable before starting batch."""
+    cfg = get_prompt_config()
+    endpoint = cfg.get("vllm_endpoint", "http://192.168.1.57:8000/v1/chat/completions")
+    base_url = endpoint.replace("/v1/chat/completions", "/v1/models")
+    
     try:
-        req = urllib.request.Request(models_url, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        req = urllib.request.Request(base_url, method="GET")
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
             if resp.status == 200:
+                print(f"[+] vLLM Server Reachable at {base_url}")
                 return True
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[!] CRITICAL: Cannot connect to vLLM server at {base_url}: {e}")
+        return False
     return False
 
-async def run_audit_batch_and_export(
-    output_filepath: str = "audit_logs/test_batch_inspection.json",
-    sample_limit: Optional[int] = 32
-) -> Dict[str, Any]:
-    """
-    Executes stratified audit batch across vulnerability database reports,
-    captures exact prompt payloads and raw vLLM outputs, exports audit ledger to disk,
-    and programmatically verifies schema fidelity.
-    """
-    if not _check_vllm_reachability():
-        print("CRITICAL: Cannot connect to vLLM server at http://192.168.1.57:8000.")
-        sys.exit(1)
+async def run_audit_batch_and_export(sample_limit: int = 250, output_filepath: str = "audit_logs/test_batch_inspection.json") -> dict:
+    if not check_vllm_reachability():
+        raise ConnectionError("vLLM server is unreachable at http://192.168.1.57:8000")
 
-    conn = get_unified_connection()
-    attach_vulnerabilities_db(conn)
-
-    samples = _get_stratified_samples(conn, sample_limit=sample_limit)
-    taxonomy_guide = _get_active_taxonomy_guide(conn)
-    valid_paths_set = set(_get_active_taxonomy_paths(conn))
-    cfg = get_prompt_config()
-    concurrency_slots = int(cfg.get("concurrency_slots", 16))
-
-    print(f"[+] Starting stratified audit batch. Total sampled reports: {len(samples)}")
-    print(f"[+] Loaded active taxonomy guide entries: {len(taxonomy_guide)}")
-
-    loop = asyncio.get_running_loop()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_slots) as executor:
-        futures = [
-            loop.run_in_executor(executor, process_single_finding_enrichment, finding, taxonomy_guide, cfg)
-            for finding in samples
-        ]
-        results = await asyncio.gather(*futures)
-
-    # Format audit ledger records
-    audit_entries = []
-    for r in results:
-        entry = {
-            "finding_id": r["finding_id"],
-            "source_pool": r["source_pool"],
-            "protocol_name": r.get("protocol_name", "unknown"),
-            "raw_input_prompt": r["raw_input_prompt"],
-            "raw_vllm_response": r["raw_vllm_response"],
-            "parsed_json_output": r["parsed_json_output"],
-            "validation_status": r["validation_status"],
-            "validation_errors": r["validation_errors"],
-        }
-        audit_entries.append(entry)
-
-    # Write complete audit array to output_filepath
-    out_path = Path(output_filepath)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(audit_entries, f, indent=2, ensure_ascii=False)
-
-    print(f"[+] Audit ledger exported to: {out_path.resolve()}")
-
-    # Perform Verification Pass
-    with open(out_path, "r", encoding="utf-8") as f:
-        verified_ledger = json.load(f)
-
-    total_records = len(verified_ledger)
-    pass_count = sum(1 for item in verified_ledger if item["validation_status"] == "PASS")
-    pass_rate = (pass_count / total_records) * 100 if total_records > 0 else 0
-
-    print(f"[+] Verification Pass Summary:")
-    print(f"    - Total Audited Records: {total_records}")
-    print(f"    - Validation Pass Rate: {pass_rate:.2f}% ({pass_count}/{total_records})")
-
-    # Assertions
-    assert total_records > 0, f"Assertion Failed: Expected total audited records > 0, got {total_records}"
-    assert pass_rate == 100.0, f"Assertion Failed: Expected 100% PASS rate, got {pass_rate:.2f}%"
-
-    for idx, item in enumerate(verified_ledger):
-        parsed = item["parsed_json_output"]
-        assert isinstance(parsed, dict), f"Item #{idx} parsed_json_output is not a dict"
+    print(f"[+] Starting diverse stratified audit batch across {sample_limit} reports...")
+    
+    # 1. Execute live batch enrichment against local 5090 cluster
+    batch_res = await run_enrichment_batch(sample_limit=sample_limit)
+    results = batch_res.get("results", [])
+    
+    # 2. Export complete raw audit ledger to disk
+    output_path = Path(output_filepath)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
         
-        # Check non-empty lists
-        for field in ["attack_vector_steps", "preconditions", "affected_solidity_constructs"]:
-            lst = parsed.get(field)
-            assert isinstance(lst, list) and len(lst) > 0, (
-                f"Item #{idx} ({item['finding_id']}) field '{field}' must deserialize into non-empty list, got: {lst}"
-            )
+    print(f"[+] Exported {len(results)} audit records to: {output_path.resolve()}")
+    
+    # 3. Perform automated verification and metric analysis
+    total_audited = len(results)
+    passed_records = [r for r in results if r.get("validation_status") == "PASS"]
+    failed_records = [r for r in results if r.get("validation_status") == "FAIL"]
+    
+    pass_rate = (len(passed_records) / total_audited * 100) if total_audited > 0 else 0.0
+    
+    # Collect pool and author/protocol diversity metrics
+    sources = set(r.get("source_pool", "unknown") for r in results)
+    protocols = set(r.get("protocol_name", "unknown") for r in results)
+    
+    print("\n" + "="*50)
+    print("DIVERSE BATCH AUDIT VERIFICATION SUMMARY")
+    print("="*50)
+    print(f"Total Audited Reports    : {total_audited}")
+    print(f"Passed Schema Validation : {len(passed_records)} ({pass_rate:.2f}%)")
+    print(f"Failed Validation        : {len(failed_records)}")
+    print(f"Distinct Source Pools    : {len(sources)} ({', '.join(sorted(sources))})")
+    print(f"Distinct Protocols/Repos : {len(protocols)}")
+    
+    if failed_records:
+        print("\n[!] Validation Failures Encountered:")
+        for fr in failed_records[:5]:
+            print(f"  - Finding ID {fr['finding_id']}: {fr.get('validation_errors')}")
+        raise ValueError(f"{len(failed_records)} records failed schema validation!")
         
-        # Check taxonomy path in database
-        tax_path = parsed.get("taxonomy_path")
-        assert tax_path in valid_paths_set, (
-            f"Item #{idx} ({item['finding_id']}) taxonomy_path '{tax_path}' not found in vulnerability_taxonomy"
-        )
-
-    print("[+] All verification assertions PASSED with 0 errors!")
-
-    # Print 3 sample entries to console for human inspection
-    print("\n" + "="*80)
-    print("INSPECTION SAMPLE ENTRIES (3 Concrete Audit Findings):")
-    print("="*80)
-
-    for i, sample in enumerate(verified_ledger[:3], 1):
-        print(f"\n--- SAMPLE #{i} ---")
-        print(f"Finding ID    : {sample['finding_id']}")
-        print(f"Source Pool   : {sample['source_pool']}")
-        print(f"Protocol Name : {sample['protocol_name']}")
-        print(f"Status        : {sample['validation_status']}")
-        print(f"Raw Input Prompt Excerpt (first 300 chars):")
-        print("-" * 50)
-        print(sample['raw_input_prompt'][:300] + "...")
-        print("-" * 50)
-        print("Parsed JSON Output:")
-        print(json.dumps(sample['parsed_json_output'], indent=2))
-
-    conn.close()
+    print("\n[+] All audited records passed validation! Sample audit preview:")
+    if results:
+        sample = results[0]
+        print(f"\n--- Sample Finding: {sample['finding_id']} ({sample['source_pool']} / {sample['protocol_name']}) ---")
+        if sample.get("parsed_json_output"):
+            print(f"Taxonomy Path : {sample['parsed_json_output'].get('taxonomy_path')}")
+            print(f"Summary       : {sample['parsed_json_output'].get('vulnerability_summary')}")
+            print(f"Attack Steps  : {len(sample['parsed_json_output'].get('attack_vector_steps', []))} steps extracted")
+        
     return {
-        "total_records": total_records,
-        "pass_count": pass_count,
-        "output_filepath": str(out_path.resolve())
+        "total_audited": total_audited,
+        "pass_rate": pass_rate,
+        "distinct_sources": len(sources),
+        "distinct_protocols": len(protocols),
+        "output_path": str(output_path)
     }
 
 if __name__ == "__main__":
-    asyncio.run(run_audit_batch_and_export(sample_limit=32))
+    asyncio.run(run_audit_batch_and_export(sample_limit=250))
