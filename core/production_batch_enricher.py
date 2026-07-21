@@ -80,37 +80,30 @@ async def run_production_78k_enrichment(limit: Optional[int] = None, run_inferen
     cfg["model_name"] = cfg.get("model_name", "Kbenkhaled/Qwen3.5-9B-NVFP4")
 
     concurrency_slots = 240
-    chunk_size = 100
     processed_count = 0
     start_time = time.time()
 
-    print(f"[+] Launching inference worker pool with {concurrency_slots} concurrency slots...")
+    print(f"[+] Launching continuous worker pool with EXACTLY {concurrency_slots} parallel requests ACTIVE ALL THE TIME...")
     print(f"[+] Target endpoint: {cfg['vllm_endpoint']} | Model: {cfg['model_name']}")
 
     loop = asyncio.get_running_loop()
+    queue = asyncio.Queue()
+    for item in staged_items:
+        queue.put_nowait(item)
 
-    # Process staged items in chunks of 100
-    for chunk_start in range(0, total_target, chunk_size):
-        chunk_findings = staged_items[chunk_start:chunk_start + chunk_size]
+    db_lock = asyncio.Lock()
+    pending_commit = []
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_slots) as executor:
-            futures = [
-                loop.run_in_executor(executor, process_single_finding_enrichment, finding, taxonomy_guide, cfg)
-                for finding in chunk_findings
-            ]
-            chunk_results = await asyncio.gather(*futures)
-
-        # Commit chunk results into database inside DB_LOCK transaction
+    async def commit_records(records: List[Dict[str, Any]]):
+        nonlocal processed_count
+        if not records:
+            return
         with DB_LOCK:
             with conn:
-                for res in chunk_results:
-                    data = res.get("payload")
-                    if not data or res.get("validation_status") != "PASS":
-                        continue
-
-                    finding_id = res["finding_id"]
-                    source_pool = res["source_pool"]
-
+                for r in records:
+                    data = r["payload"]
+                    finding_id = r["finding_id"]
+                    source_pool = r["source_pool"]
                     tax_path = data.get("taxonomy_path", "smart_contract/reentrancy/read_only/view_desync")
                     summary = data.get("vulnerability_summary", "")
                     root_cause = data.get("root_cause_explanation", "")
@@ -147,14 +140,42 @@ async def run_production_78k_enrichment(limit: Optional[int] = None, run_inferen
 
                     processed_count += 1
 
-        # Calculate live speed, elapsed time, and ETA telemetry
         elapsed_sec = time.time() - start_time
         speed = processed_count / elapsed_sec if elapsed_sec > 0 else 0.0
         remaining_items = total_target - processed_count
         eta_min = (remaining_items / speed) / 60.0 if speed > 0 else 0.0
         elapsed_min = elapsed_sec / 60.0
-
         print(f"[Processed: {processed_count} / {total_target} | Speed: {speed:.2f} items/sec | Elapsed: {elapsed_min:.2f} min | ETA: {eta_min:.2f} min]")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_slots) as executor:
+        async def worker():
+            while True:
+                try:
+                    finding = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                res = await loop.run_in_executor(executor, process_single_finding_enrichment, finding, taxonomy_guide, cfg)
+                if res and res.get("validation_status") == "PASS" and res.get("payload"):
+                    records_to_commit = None
+                    async with db_lock:
+                        pending_commit.append(res)
+                        if len(pending_commit) >= 10:
+                            records_to_commit = list(pending_commit)
+                            pending_commit.clear()
+
+                    if records_to_commit:
+                        await commit_records(records_to_commit)
+
+                queue.task_done()
+
+        # Launch 240 worker tasks simultaneously (100% saturation at all times)
+        workers = [asyncio.create_task(worker()) for _ in range(concurrency_slots)]
+        await asyncio.gather(*workers)
+
+        if pending_commit:
+            await commit_records(pending_commit)
+            pending_commit.clear()
 
     conn.close()
     return {

@@ -3,9 +3,41 @@ import json
 import urllib.request
 import traceback
 import sqlite3
+import threading
+import time
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 from core.database import get_unified_connection, attach_vulnerabilities_db, DB_LOCK
 from core.pipeline import get_prompt_config
+
+SKIPPED_LOCK = threading.Lock()
+SKIPPED_FINDINGS_FILE = Path(__file__).parent.parent / "audit_logs" / "skipped_findings_for_other_model.json"
+
+def _save_skipped_finding(finding: Dict[str, Any], reason: str):
+    """Saves unparsed/skipped finding details to audit_logs/skipped_findings_for_other_model.json for secondary model processing."""
+    with SKIPPED_LOCK:
+        skipped_list = []
+        if SKIPPED_FINDINGS_FILE.exists():
+            try:
+                with open(SKIPPED_FINDINGS_FILE, "r", encoding="utf-8") as f:
+                    skipped_list = json.load(f)
+            except Exception:
+                skipped_list = []
+
+        existing_ids = {item.get("id") for item in skipped_list}
+        if finding["id"] not in existing_ids:
+            skipped_list.append({
+                "id": finding["id"],
+                "source_pool": finding.get("source_pool", "unknown"),
+                "protocol_name": finding.get("protocol_name") or finding.get("source_repo") or "unknown",
+                "title": finding.get("title", ""),
+                "severity": finding.get("severity", "high"),
+                "skip_reason": reason,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            })
+            SKIPPED_FINDINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(SKIPPED_FINDINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(skipped_list, f, indent=2)
 
 def _get_stratified_samples(conn: sqlite3.Connection, sample_limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """Selects stratified findings query taking up to 3 reports per distinct (source_pool, protocol_name/source_repo) group."""
@@ -45,6 +77,95 @@ def _get_active_taxonomy_paths(conn: sqlite3.Connection) -> List[str]:
     cursor.execute("SELECT path FROM vuln.vulnerability_taxonomy")
     return [r[0] for r in cursor.fetchall()]
 
+def _parse_json_from_reasoning_or_content(content_text: str, reasoning_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extracts valid JSON object from content_text or reasoning_text.
+    Handles thinking tags <think>...</think>, reasoning fields, markdown blocks ```json...```,
+    and text before/after JSON objects.
+    """
+    candidates = []
+
+    # 1. Handle <think>...</think> tags inside content_text
+    if content_text and "<think>" in content_text and "</think>" in content_text:
+        parts = content_text.split("</think>")
+        after_think = parts[1].strip()
+        think_body = parts[0].replace("<think>", "").strip()
+        if after_think:
+            candidates.append(after_think)
+        if think_body:
+            candidates.append(think_body)
+    elif content_text and content_text.strip():
+        candidates.append(content_text.strip())
+
+    if reasoning_text and reasoning_text.strip():
+        candidates.append(reasoning_text.strip())
+
+    for raw in candidates:
+        if not raw:
+            continue
+
+        cleaned = raw
+        # Extract contents inside markdown code block if present
+        if "```" in cleaned:
+            if "```json" in cleaned:
+                parts = cleaned.split("```json")
+                for p in parts[1:]:
+                    if "```" in p:
+                        code_content = p.split("```")[0].strip()
+                        if code_content:
+                            try:
+                                obj = json.loads(code_content)
+                                if isinstance(obj, dict) and "vulnerability_summary" in obj:
+                                    return obj
+                            except Exception:
+                                pass
+            else:
+                parts = cleaned.split("```")
+                for p in parts[1:]:
+                    if p.strip():
+                        try:
+                            obj = json.loads(p.strip())
+                            if isinstance(obj, dict) and "vulnerability_summary" in obj:
+                                return obj
+                        except Exception:
+                            pass
+
+        # Try direct json.loads
+        try:
+            obj = json.loads(cleaned)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+        # Try substring slicing between outermost '{' and '}'
+        s_idx = cleaned.find("{")
+        e_idx = cleaned.rfind("}")
+        if s_idx != -1 and e_idx != -1 and e_idx > s_idx:
+            sliced = cleaned[s_idx:e_idx+1]
+            try:
+                obj = json.loads(sliced)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+
+        # Robust scan: find '{' from right-to-left inside long reasoning/thinking text
+        if e_idx != -1:
+            curr_pos = e_idx
+            while True:
+                curr_pos = cleaned.rfind("{", 0, curr_pos)
+                if curr_pos == -1:
+                    break
+                try:
+                    obj = json.loads(cleaned[curr_pos:e_idx+1])
+                    if isinstance(obj, dict) and ("vulnerability_summary" in obj or "taxonomy_path" in obj):
+                        return obj
+                except Exception:
+                    pass
+
+    return None
+
 def process_single_finding_enrichment(
     finding: Dict[str, Any],
     taxonomy_guide_or_paths: Any,
@@ -56,7 +177,7 @@ def process_single_finding_enrichment(
     """
     endpoint = cfg.get("vllm_endpoint", "http://192.168.1.57:8000/v1/chat/completions")
     model_name = cfg.get("model_name", "nvidia/Qwen3.6-27B-NVFP4")
-    max_tokens = cfg.get("max_tokens", 4096)
+    max_tokens = cfg.get("max_tokens", 2048)
 
     title = finding.get("title", "Vulnerability Finding")
     content = finding.get("content_markdown", "") or f"Title: {title}"
@@ -97,58 +218,32 @@ def process_single_finding_enrichment(
     validation_status = "FAIL"
     validation_errors = []
 
-    max_retries = 10
-    for attempt in range(max_retries):
-        try:
-            req_data = json.dumps(payload).encode("utf-8")
-            headers = {"Content-Type": "application/json"}
-            req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
-            
-            with urllib.request.urlopen(req, timeout=180.0) as resp:
-                resp_bytes = resp.read()
-                resp_json = json.loads(resp_bytes.decode("utf-8"))
-                msg = resp_json["choices"][0]["message"]
-                
-                # Prefer content field; if None, attempt extracting JSON from reasoning
-                content_text = msg.get("content") or ""
-                reasoning_text = msg.get("reasoning_content") or msg.get("reasoning") or ""
-                
-                raw_content = content_text.strip()
-                if not raw_content and reasoning_text:
-                    # Search for JSON object within reasoning
-                    s_idx = reasoning_text.find("{")
-                    e_idx = reasoning_text.rfind("}")
-                    if s_idx != -1 and e_idx != -1 and e_idx > s_idx:
-                        raw_content = reasoning_text[s_idx:e_idx+1]
-                    else:
-                        raw_content = reasoning_text
+    try:
+        req_data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
 
-                raw_vllm_response = raw_content.strip()
-                if not raw_vllm_response:
-                    raise ValueError("vLLM response message content is empty or null")
-                
-                try:
-                    extracted_data = json.loads(raw_vllm_response)
-                except Exception:
-                    # Attempt JSON repair (strip markdown blocks / slice JSON brackets)
-                    cleaned = raw_vllm_response.replace("```json", "").replace("```", "").strip()
-                    s_idx = cleaned.find("{")
-                    e_idx = cleaned.rfind("}")
-                    if s_idx != -1 and e_idx != -1 and e_idx > s_idx:
-                        extracted_data = json.loads(cleaned[s_idx:e_idx+1])
-                    else:
-                        raise
-                break
-        except Exception as e:
-            if attempt < max_retries - 1:
-                print(f"[!] Timeout/Error for finding {finding['id']} (attempt {attempt+1}/{max_retries}): {e}. Resending request...")
-                import time
-                time.sleep(1.0)
-            else:
-                print(f"[-] vLLM Request Failed for finding {finding['id']} after {max_retries} attempts: {e}")
-                validation_errors.append(f"vLLM Request Error: {e}")
-                raw_vllm_response = None
-                extracted_data = None
+        with urllib.request.urlopen(req, timeout=120.0) as resp:
+            resp_bytes = resp.read()
+            resp_json = json.loads(resp_bytes.decode("utf-8"))
+            msg = resp_json["choices"][0]["message"]
+
+            content_text = msg.get("content") or ""
+            reasoning_text = msg.get("reasoning_content") or msg.get("reasoning") or ""
+
+            extracted_data = _parse_json_from_reasoning_or_content(content_text, reasoning_text)
+            if not extracted_data:
+                raise ValueError(f"Could not parse valid JSON from content or reasoning (content length: {len(content_text)}, reasoning length: {len(reasoning_text)})")
+    except Exception as e:
+        print(f"[+] Saved for secondary model (JSON parse failed for {finding['id']}): {e}")
+        _save_skipped_finding(finding, str(e))
+        return {
+            "finding_id": finding["id"],
+            "source_pool": finding.get("source_pool", "unknown"),
+            "validation_status": "SKIPPED",
+            "validation_errors": [str(e)],
+            "payload": None
+        }
 
     # Strict validation of raw vLLM output (NO defaults or mock fallbacks)
     if not isinstance(extracted_data, dict):

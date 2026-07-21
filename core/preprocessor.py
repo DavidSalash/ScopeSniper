@@ -59,8 +59,9 @@ def get_static_system_prompt(taxonomy_guide: List[Dict[str, str]]) -> str:
         f"Valid active taxonomy guide: {json.dumps(taxonomy_guide)}\n"
         "IMPORTANT CONSTRAINTS:\n"
         "1. You MUST select a 'taxonomy_path' strictly present in the valid active taxonomy guide above.\n"
-        "2. Keep 'thinking_process' concise (1-2 sentences) so output fits within token budget.\n"
-        "3. The array fields ('attack_vector_steps', 'preconditions', 'affected_solidity_constructs') MUST ALWAYS be non-empty lists with at least 1 string element.\n\n"
+        "2. Keep internal reasoning and 'thinking_process' extremely concise (1-2 sentences). Do NOT output conversational chatter or runaway text.\n"
+        "3. The array fields ('attack_vector_steps', 'preconditions', 'affected_solidity_constructs') MUST ALWAYS be non-empty lists with at least 1 string element.\n"
+        "4. CRITICAL DIRECTIVE: Do NOT write conversational reasoning. Return ONLY the JSON object immediately.\n\n"
         "Output ONLY a valid JSON object strictly matching this payload schema:\n"
         "{\n"
         '  "thinking_process": "<brief 1-2 sentence step-by-step reasoning about the finding>",\n'

@@ -1,20 +1,30 @@
+import sys
+from pathlib import Path
+WORKSPACE_DIR = Path(__file__).parent.parent.resolve()
+if str(WORKSPACE_DIR) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_DIR))
+
+import asyncio
 import json
+from api.server import export_compact_batch
 
-data = json.load(open('full_export.json', 'r', encoding='utf-8'))
-requests = data.get('requests', [])
-print(f"[+] Total requests exported: {len(requests)}")
+async def main():
+    res = await export_compact_batch(limit=3, download=False)
+    with open("github_enriched_export.json", "w", encoding="utf-8") as f:
+        json.dump(res, f, indent=2)
+    
+    requests = res.get("requests", [])
+    print(f"Exported {len(requests)} items to github_enriched_export.json")
+    for i, item in enumerate(requests):
+        print(f"\n==================== ITEM {i+1}: {item.get('title')} ====================")
+        print(f"ID: {item.get('id')}")
+        user_prompt = item.get("user_prompt", "")
+        # Print snippet section
+        if "### Extracted Referenced Code Snippet" in user_prompt:
+            idx = user_prompt.find("### Extracted Referenced Code Snippet")
+            print("Extracted snippet found:\n", user_prompt[idx:idx+800])
+        else:
+            print("Tail of user prompt:\n", user_prompt[-500:])
 
-for i, r in enumerate(requests):
-    fid = r.get("id")
-    p_len = len(r.get("user_prompt", ""))
-    ps_len = len(r.get("user_prompt_snippet", ""))
-    tokens = r.get("total_tokens")
-    tier = r.get("context_tier")
-    print(f"\nItem #{i+1}:")
-    print(f"  ID                  : {fid}")
-    print(f"  Context Tier        : {tier}")
-    print(f"  Total Tokens        : {tokens}")
-    print(f"  User Prompt Length  : {p_len:,} chars")
-    print(f"  User Prompt Snippet : {ps_len:,} chars")
-    snippet = r.get("user_prompt", "")[:400]
-    print(f"  User Prompt Excerpt:\n{snippet}\n...")
+if __name__ == "__main__":
+    asyncio.run(main())
