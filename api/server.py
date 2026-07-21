@@ -2,6 +2,7 @@ import time
 import json
 import asyncio
 import sys
+import subprocess
 from pathlib import Path
 
 # Add project root to sys.path
@@ -429,6 +430,189 @@ async def event_stream(request: Request):
             
     return StreamingResponse(generate_telemetry(), media_type="text/event-stream")
 
+# ── PRE-PROCESSED QUEUE & CONTROL API ENDPOINTS ─────────────────────────────
+
+_QUEUE_CACHE = None
+_QUEUE_CACHE_MTIME = 0
+BATCH_INFERENCE_PROC: Optional[subprocess.Popen] = None
+
+def load_queue_distribution() -> Dict[str, Any]:
+    global _QUEUE_CACHE, _QUEUE_CACHE_MTIME
+    log_file = WORKSPACE_DIR / "audit_logs" / "queue_distribution.json"
+    if not log_file.exists():
+        return {"total_staged": 0, "summary_counts": {}, "buckets": {}}
+    try:
+        mtime = log_file.stat().st_mtime
+        if _QUEUE_CACHE is None or mtime > _QUEUE_CACHE_MTIME:
+            with open(log_file, "r", encoding="utf-8") as f:
+                _QUEUE_CACHE = json.load(f)
+            _QUEUE_CACHE_MTIME = mtime
+    except Exception as e:
+        print(f"[-] Error reading queue_distribution.json: {e}")
+        if _QUEUE_CACHE is None:
+            return {"total_staged": 0, "summary_counts": {}, "buckets": {}}
+    return _QUEUE_CACHE
+
+@app.get("/api/batch/queue")
+def get_batch_queue(
+    page: int = 1,
+    limit: int = 50,
+    tier: Optional[str] = None,
+    search: Optional[str] = None
+):
+    """
+    Exposes pre-processed requests from audit_logs/queue_distribution.json
+    with live status attached from vuln.enriched_findings_metadata.
+    Supports tier filtering and text search over id, protocol_name, title, source_pool.
+    """
+    queue_data = load_queue_distribution()
+    total_staged = queue_data.get("total_staged") or queue_data.get("total_unprocessed_findings") or 0
+    summary_counts = queue_data.get("summary_counts", {
+        "less_than_1k": 0,
+        "1k_to_2k": 0,
+        "2k_to_4k": 0,
+        "greater_than_4k": 0
+    })
+    buckets = queue_data.get("buckets", {})
+
+    # Fetch completed finding IDs from database
+    completed_ids = set()
+    try:
+        conn = get_unified_connection()
+        from core.database import attach_vulnerabilities_db
+        attach_vulnerabilities_db(conn)
+        cursor = conn.cursor()
+        cursor.execute("SELECT finding_id FROM vuln.enriched_findings_metadata")
+        completed_ids = set(r[0] for r in cursor.fetchall())
+        conn.close()
+    except Exception as e:
+        print(f"[-] Error fetching completed IDs: {e}")
+
+    # Collect items based on tier filter
+    staged_items: List[Dict[str, Any]] = []
+    tier_keys = ["less_than_1k", "1k_to_2k", "2k_to_4k", "greater_than_4k"]
+    
+    if tier and tier in buckets:
+        selected_tiers = [tier]
+    else:
+        selected_tiers = [t for t in tier_keys if t in buckets]
+
+    for t_key in selected_tiers:
+        for raw_item in buckets.get(t_key, []):
+            item = dict(raw_item)
+            item["context_tier"] = t_key
+            fid = item.get("id")
+            is_completed = fid in completed_ids
+            item["enrichment_status"] = "COMPLETED" if is_completed else "PENDING"
+            item["status"] = item["enrichment_status"]
+            staged_items.append(item)
+
+    # Apply search filter if provided
+    if search:
+        search_lower = search.strip().lower()
+        filtered = []
+        for item in staged_items:
+            fid = str(item.get("id", "")).lower()
+            proto = str(item.get("protocol_name", "")).lower()
+            title = str(item.get("title", "")).lower()
+            pool = str(item.get("source_pool", "")).lower()
+            if (search_lower in fid or search_lower in proto or 
+                search_lower in title or search_lower in pool):
+                filtered.append(item)
+        staged_items = filtered
+
+    total_matching = len(staged_items)
+
+    # Apply pagination
+    page = max(1, page)
+    limit = max(1, limit)
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    paginated_items = staged_items[start_idx:end_idx]
+
+    return {
+        "status": "success",
+        "total_staged": total_staged,
+        "page": page,
+        "limit": limit,
+        "total": total_matching,
+        "summary_counts": summary_counts,
+        "items": paginated_items
+    }
+
+@app.api_route("/api/batch/control", methods=["GET", "POST"])
+def batch_control(payload: Optional[Dict[str, Any]] = Body(None), action: Optional[str] = None):
+    """
+    Trigger or pause background execution of core/production_batch_enricher.py --run-inference.
+    Actions: 'start' / 'run', 'pause' / 'stop', 'status'.
+    """
+    global BATCH_INFERENCE_PROC
+
+    req_action = action
+    if not req_action and payload:
+        req_action = payload.get("action")
+    if not req_action:
+        req_action = "status"
+
+    req_action = req_action.lower().strip()
+
+    is_running = BATCH_INFERENCE_PROC is not None and BATCH_INFERENCE_PROC.poll() is None
+
+    if req_action in ["start", "run", "launch"]:
+        if is_running:
+            return {
+                "status": "success",
+                "message": "Production batch inference process is already running.",
+                "batch_status": "RUNNING",
+                "pid": BATCH_INFERENCE_PROC.pid
+            }
+        
+        enricher_script = WORKSPACE_DIR / "core" / "production_batch_enricher.py"
+        try:
+            BATCH_INFERENCE_PROC = subprocess.Popen(
+                [sys.executable, str(enricher_script), "--run-inference"],
+                cwd=str(WORKSPACE_DIR)
+            )
+            return {
+                "status": "success",
+                "message": "Production batch inference run launched.",
+                "batch_status": "RUNNING",
+                "pid": BATCH_INFERENCE_PROC.pid
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to launch batch inference run: {e}")
+
+    elif req_action in ["pause", "stop"]:
+        if is_running and BATCH_INFERENCE_PROC:
+            try:
+                BATCH_INFERENCE_PROC.terminate()
+                BATCH_INFERENCE_PROC.wait(timeout=5)
+            except Exception:
+                BATCH_INFERENCE_PROC.kill()
+            BATCH_INFERENCE_PROC = None
+            return {
+                "status": "success",
+                "message": "Production batch inference run paused/stopped.",
+                "batch_status": "STOPPED"
+            }
+        else:
+            BATCH_INFERENCE_PROC = None
+            return {
+                "status": "success",
+                "message": "No active batch inference process running.",
+                "batch_status": "STOPPED"
+            }
+
+    elif req_action == "status":
+        return {
+            "status": "success",
+            "batch_status": "RUNNING" if is_running else "STOPPED",
+            "pid": BATCH_INFERENCE_PROC.pid if is_running and BATCH_INFERENCE_PROC else None
+        }
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action '{req_action}'. Valid actions: start, pause, status.")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api.server:app", host="0.0.0.0", port=10000, reload=True)
+

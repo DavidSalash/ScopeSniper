@@ -424,6 +424,419 @@ function EditItemPromptsView({ item, onSaveAndRequeue }: {
   )
 }
 
+export interface PreProcessedItem {
+  id: string
+  source_pool: string
+  protocol_name: string
+  title: string
+  severity?: string
+  system_prompt_tokens?: number
+  user_prompt_tokens?: number
+  total_tokens: number
+  context_tier: string
+  enrichment_status: "COMPLETED" | "PENDING"
+  status?: string
+}
+
+export interface SummaryCounts {
+  less_than_1k: number
+  "1k_to_2k": number
+  "2k_to_4k": number
+  greater_than_4k: number
+}
+
+function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg: string, type?: "info" | "warn" | "error") => void }) {
+  const [items, setItems] = useState<PreProcessedItem[]>([])
+  const [summaryCounts, setSummaryCounts] = useState<SummaryCounts>({
+    less_than_1k: 0,
+    "1k_to_2k": 77875,
+    "2k_to_4k": 508,
+    greater_than_4k: 0
+  })
+  const [totalStaged, setTotalStaged] = useState(78383)
+  const [totalMatching, setTotalMatching] = useState(0)
+  const [page, setPage] = useState(1)
+  const [limit, setLimit] = useState(50)
+  const [selectedTier, setSelectedTier] = useState<string | null>(null)
+  const [searchQuery, setSearchQuery] = useState("")
+  const [debouncedSearch, setDebouncedSearch] = useState("")
+  const [loading, setLoading] = useState(true)
+
+  // Control State
+  const [batchStatus, setBatchStatus] = useState<"RUNNING" | "STOPPED">("STOPPED")
+  const [isControlling, setIsControlling] = useState(false)
+
+  // Debounce search query updates
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedSearch(searchQuery)
+    }, 300)
+    return () => clearTimeout(handler)
+  }, [searchQuery])
+
+  const fetchPreprocessedQueue = useCallback(async (showLoading = false) => {
+    if (showLoading) setLoading(true)
+    try {
+      const params = new URLSearchParams()
+      params.append("page", page.toString())
+      params.append("limit", limit.toString())
+      if (selectedTier) params.append("tier", selectedTier)
+      if (debouncedSearch.trim()) params.append("search", debouncedSearch.trim())
+
+      const res = await fetch(`${API_URL}/batch/queue?${params.toString()}`)
+      if (res.ok) {
+        const data = await res.json()
+        setItems(data.items || [])
+        setTotalStaged(data.total_staged || 78383)
+        setTotalMatching(data.total || (data.items ? data.items.length : 0))
+        if (data.summary_counts) setSummaryCounts(data.summary_counts)
+      } else {
+        addConsoleLog(`Failed to fetch preprocessed queue: ${res.statusText}`, "error")
+      }
+    } catch (e) {
+      addConsoleLog(`Error requesting preprocessed queue: ${e}`, "error")
+    } finally {
+      setLoading(false)
+    }
+  }, [page, limit, selectedTier, debouncedSearch, addConsoleLog])
+
+  const checkBatchStatus = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_URL}/batch/control?action=status`)
+      if (res.ok) {
+        const data = await res.json()
+        setBatchStatus(data.batch_status || "STOPPED")
+      }
+    } catch (e) {
+      console.error("Failed to check batch control status:", e)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchPreprocessedQueue(items.length === 0)
+  }, [page, limit, selectedTier, debouncedSearch])
+
+  useEffect(() => {
+    checkBatchStatus()
+    const interval = setInterval(checkBatchStatus, 5000)
+    return () => clearInterval(interval)
+  }, [checkBatchStatus])
+
+  const handleToggleInferenceRun = async () => {
+    setIsControlling(true)
+    const targetAction = batchStatus === "RUNNING" ? "pause" : "start"
+    addConsoleLog(`Sending batch control command: '${targetAction}'...`, "info")
+    try {
+      const res = await fetch(`${API_URL}/batch/control`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: targetAction })
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setBatchStatus(data.batch_status || "STOPPED")
+        addConsoleLog(`Batch control response: ${data.message}`, "info")
+        fetchPreprocessedQueue()
+      } else {
+        const err = await res.text()
+        addConsoleLog(`Batch control command failed: ${err}`, "error")
+      }
+    } catch (e) {
+      addConsoleLog(`Exception sending batch control command: ${e}`, "error")
+    } finally {
+      setIsControlling(false)
+    }
+  }
+
+  const totalPages = Math.ceil(totalMatching / limit) || 1
+
+  return (
+    <div className="flex flex-col gap-6">
+      {/* Control Banner & Action Trigger */}
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-950/70 border border-slate-800/80 p-4 rounded-xl backdrop-blur-xs">
+        <div className="flex items-center gap-3">
+          <div className="p-2 bg-sky-500/10 border border-sky-500/20 rounded-lg text-sky-400">
+            <Cpu className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 className="text-base font-bold text-white tracking-wide uppercase">
+                78k Pre-Processed Inference Queue Inspector
+              </h2>
+              <Badge className={batchStatus === "RUNNING" ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30 animate-pulse font-mono" : "bg-slate-800 text-slate-400 border-slate-700 font-mono"}>
+                {batchStatus === "RUNNING" ? "INFERENCE ACTIVE" : "IDLE / STOPPED"}
+              </Badge>
+            </div>
+            <p className="text-xs text-slate-400 font-mono mt-0.5">
+              Total Staged Records: <span className="text-sky-300 font-bold">{totalStaged.toLocaleString()}</span> | Formatted Token Vectors Ready for GPU Enrichment
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <Button
+            size="sm"
+            className={batchStatus === "RUNNING" 
+              ? "bg-rose-600 hover:bg-rose-700 text-white font-mono flex items-center gap-2" 
+              : "bg-emerald-600 hover:bg-emerald-700 text-white font-mono flex items-center gap-2 shadow-[0_0_12px_rgba(16,185,129,0.3)]"}
+            disabled={isControlling}
+            onClick={handleToggleInferenceRun}
+          >
+            {isControlling ? (
+              <RefreshCw className="w-4 h-4 animate-spin" />
+            ) : batchStatus === "RUNNING" ? (
+              <ZapOff className="w-4 h-4" />
+            ) : (
+              <Play className="w-4 h-4 fill-current" />
+            )}
+            {batchStatus === "RUNNING" ? "Pause Inference Run" : "Launch Inference Run"}
+          </Button>
+
+          <Button
+            variant="outline"
+            size="sm"
+            className="border-slate-800 hover:bg-slate-900 bg-slate-950 text-slate-300 h-9 font-mono"
+            onClick={() => fetchPreprocessedQueue()}
+          >
+            <RefreshCw className="w-3.5 h-3.5 mr-1.5 text-sky-400" />
+            Refresh Queue
+          </Button>
+        </div>
+      </div>
+
+      {/* 1. Token Tier Cards (4 Tiers: <1k, 1k-2k, 2k-4k, >4k) */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+        {[
+          { key: "less_than_1k", label: "<1k Tokens", color: "from-emerald-500/20 to-teal-500/10", border: "border-emerald-500/20" },
+          { key: "1k_to_2k", label: "1k - 2k Tokens", color: "from-teal-500/20 to-cyan-500/10", border: "border-teal-500/20" },
+          { key: "2k_to_4k", label: "2k - 4k Tokens", color: "from-cyan-500/20 to-sky-500/10", border: "border-cyan-500/20" },
+          { key: "greater_than_4k", label: ">4k Tokens", color: "from-sky-500/20 to-indigo-500/10", border: "border-sky-500/20" }
+        ].map((card) => {
+          const count = summaryCounts[card.key as keyof SummaryCounts] || 0
+          const isFilterActive = selectedTier === card.key
+          const percentage = totalStaged > 0 ? ((count / totalStaged) * 100).toFixed(1) : "0.0"
+
+          return (
+            <Card
+              key={card.key}
+              className={`bg-slate-950/70 border ${card.border} backdrop-blur-xs relative overflow-hidden transition-all duration-300 cursor-pointer hover:border-slate-500 ${isFilterActive ? "ring-2 ring-sky-500 shadow-[0_0_15px_rgba(56,189,248,0.25)]" : ""}`}
+              onClick={() => {
+                setSelectedTier(isFilterActive ? null : card.key)
+                setPage(1)
+              }}
+            >
+              <div className={`absolute top-0 inset-x-0 h-1 bg-gradient-to-r ${card.color}`} />
+              <CardContent className="pt-5 pb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-slate-400 text-xs font-semibold uppercase tracking-wider">{card.label}</span>
+                  {isFilterActive && (
+                    <Badge className="bg-sky-500/20 text-sky-400 border border-sky-500/30 rounded px-1.5 font-bold uppercase text-[9px]">
+                      FILTERED
+                    </Badge>
+                  )}
+                </div>
+
+                <div className="flex items-baseline justify-between mb-3">
+                  <span className="text-3xl font-bold text-white tracking-tight">{count.toLocaleString()}</span>
+                  <span className="text-slate-400 text-xs font-mono">{percentage}% of queue</span>
+                </div>
+
+                <Progress value={parseFloat(percentage)} className="h-1.5" />
+              </CardContent>
+            </Card>
+          )
+        })}
+      </div>
+
+      {/* 2. Search & Filter Controls and Data Table */}
+      <Card className="bg-slate-950/70 border border-slate-800/80 backdrop-blur-xs overflow-hidden">
+        <CardHeader className="border-b border-slate-900 pb-4 bg-slate-950/40">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <CardTitle className="text-sm font-semibold tracking-wider text-slate-300 uppercase flex items-center gap-2">
+                <Layers className="w-4 h-4 text-sky-400" />
+                Pre-Processed Finding Queue Table
+              </CardTitle>
+              <Badge className="bg-sky-500/10 text-sky-400 border border-sky-500/20 font-mono text-[10px]">
+                {totalMatching.toLocaleString()} Items Filtered
+              </Badge>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              {/* Search input */}
+              <div className="relative w-64">
+                <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-500" />
+                <Input
+                  placeholder="Search finding ID, protocol, pool..."
+                  className="pl-8 text-xs border-slate-800/80 bg-slate-900/50 text-slate-200 h-8"
+                  value={searchQuery}
+                  onChange={(e) => {
+                    setSearchQuery(e.target.value)
+                    setPage(1)
+                  }}
+                />
+              </div>
+
+              {/* Tier Filter Pills */}
+              <div className="flex items-center gap-1.5 text-xs text-slate-400 font-mono bg-slate-900/30 border border-slate-800/50 rounded px-2.5 py-1">
+                <Filter className="w-3.5 h-3.5 text-slate-500" />
+                <span className="text-slate-500">TIER:</span>
+                {[
+                  { id: null, label: "All" },
+                  { id: "less_than_1k", label: "<1k" },
+                  { id: "1k_to_2k", label: "1k-2k" },
+                  { id: "2k_to_4k", label: "2k-4k" },
+                  { id: "greater_than_4k", label: ">4k" }
+                ].map((t) => (
+                  <button
+                    key={t.label}
+                    onClick={() => {
+                      setSelectedTier(t.id)
+                      setPage(1)
+                    }}
+                    className={`hover:text-white transition-colors text-[11px] ${
+                      selectedTier === t.id ? "text-sky-400 font-bold" : "text-slate-400"
+                    }`}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </CardHeader>
+
+        {/* 3. Paginated Data Table */}
+        <div className="overflow-x-auto min-h-[350px]">
+          <Table className="border-collapse">
+            <TableHeader className="bg-slate-900/40 border-b border-slate-900 font-mono text-[11px] text-slate-400 uppercase tracking-wider">
+              <TableRow>
+                <TableHead className="w-12 text-slate-400">#</TableHead>
+                <TableHead className="w-64 text-slate-400">Finding ID</TableHead>
+                <TableHead className="w-32 text-slate-400">Source Pool</TableHead>
+                <TableHead className="w-48 text-slate-400">Protocol / Repo</TableHead>
+                <TableHead className="w-36 text-slate-400">Token Count</TableHead>
+                <TableHead className="w-36 text-slate-400">Context Tier</TableHead>
+                <TableHead className="w-36 text-slate-400">Enrichment Status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody className="text-xs divide-y divide-slate-900/60 font-mono">
+              {loading ? (
+                <TableRow>
+                  <TableCell colSpan={7} className="text-center py-12 text-slate-500">
+                    <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-sky-400" />
+                    Fetching pre-processed findings...
+                  </TableCell>
+                </TableRow>
+              ) : items.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={7} className="text-center py-12 text-slate-500">
+                    No pre-processed queue items match your filter criteria.
+                  </TableCell>
+                </TableRow>
+              ) : (
+                items.map((row, idx) => (
+                  <TableRow key={`${row.id}-${idx}`} className="hover:bg-slate-900/50 border-b border-slate-900/40">
+                    <TableCell className="text-slate-500 font-bold">{(page - 1) * limit + idx + 1}</TableCell>
+                    <TableCell>
+                      <div className="font-bold text-white text-xs truncate max-w-[240px]" title={row.id}>
+                        {row.id}
+                      </div>
+                      <div className="text-[10px] text-slate-500 font-mono truncate max-w-[240px]">
+                        {row.title || "No Title"}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="outline" className="bg-slate-900/80 border-slate-800 text-slate-300 font-mono text-[10px] uppercase">
+                        {row.source_pool}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="text-slate-300 font-medium">{row.protocol_name}</TableCell>
+                    <TableCell>
+                      <span className="text-sky-300 font-bold font-mono">{row.total_tokens?.toLocaleString() || 0}</span>
+                      <span className="text-[10px] text-slate-500 block font-mono">
+                        sys:{row.system_prompt_tokens || 0} | usr:{row.user_prompt_tokens || 0}
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="secondary" className="bg-indigo-950/40 border border-indigo-500/20 text-indigo-300 font-mono text-[10px]">
+                        {row.context_tier}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>
+                      {row.enrichment_status === "COMPLETED" ? (
+                        <Badge className="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shadow-[0_0_8px_rgba(16,185,129,0.2)]">
+                          <CheckCircle className="w-3 h-3 mr-1 inline" />
+                          COMPLETED
+                        </Badge>
+                      ) : (
+                        <Badge className="bg-amber-500/10 text-amber-500 border border-amber-500/20 animate-pulse">
+                          PENDING
+                        </Badge>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </div>
+
+        {/* Pagination Footer */}
+        <div className="flex flex-col sm:flex-row items-center justify-between gap-4 p-4 border-t border-slate-900 bg-slate-950/40 text-xs font-mono text-slate-400">
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2">
+              <span>Page Size:</span>
+              <select
+                className="bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:outline-none"
+                value={limit}
+                onChange={(e) => {
+                  setLimit(parseInt(e.target.value))
+                  setPage(1)
+                }}
+              >
+                <option value="25">25</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+                <option value="250">250</option>
+              </select>
+            </div>
+            <div>
+              Showing <span className="text-slate-200 font-bold">{totalMatching > 0 ? (page - 1) * limit + 1 : 0}</span> to{" "}
+              <span className="text-slate-200 font-bold">{Math.min(page * limit, totalMatching)}</span> of{" "}
+              <span className="text-slate-200 font-bold">{totalMatching.toLocaleString()}</span> entries
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className="border-slate-800 bg-slate-900 hover:bg-slate-950 text-slate-300 h-8 font-mono"
+              disabled={page <= 1 || loading}
+              onClick={() => setPage(page - 1)}
+            >
+              Previous
+            </Button>
+            <span className="text-slate-400 text-xs px-2">
+              Page {page} of {totalPages}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              className="border-slate-800 bg-slate-900 hover:bg-slate-950 text-slate-300 h-8 font-mono"
+              disabled={page >= totalPages || loading}
+              onClick={() => setPage(page + 1)}
+            >
+              Next
+            </Button>
+          </div>
+        </div>
+      </Card>
+    </div>
+  )
+}
+
 function TargetProfitabilityMatrixView() {
   const [rows, setRows] = useState<ProfitabilityRow[]>([])
   const [loading, setLoading] = useState(true)
@@ -645,7 +1058,12 @@ function TargetProfitabilityMatrixView() {
 }
 
 export default function BatchWorkspacePage() {
-  const [activeTab, setActiveTab] = useState<"queue" | "profitability">("queue")
+  const [mounted, setMounted] = useState(false)
+  const [activeTab, setActiveTab] = useState<"preprocessed" | "queue" | "profitability">("preprocessed")
+
+  useEffect(() => {
+    setMounted(true)
+  }, [])
 
   // Database States
   const [entries, setEntries] = useState<BatchEntry[]>([])
@@ -1444,6 +1862,15 @@ export default function BatchWorkspacePage() {
     return Math.round((stats.dispatched / stats.total) * 100)
   }
 
+  if (!mounted) {
+    return (
+      <div className="flex items-center justify-center min-h-[400px] text-slate-500 font-mono text-xs">
+        <RefreshCw className="w-5 h-5 animate-spin mr-2 text-sky-400" />
+        Loading Control Room Workspace...
+      </div>
+    )
+  }
+
   return (
     <div className="flex flex-col gap-6 text-slate-100 pb-12">
       {/* Header Bar with View Switching Tabs */}
@@ -1467,8 +1894,12 @@ export default function BatchWorkspacePage() {
         <div className="flex flex-wrap items-center gap-3">
           <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as any)} className="w-full md:w-auto">
             <TabsList className="bg-slate-950 border border-slate-800 p-1">
+              <TabsTrigger value="preprocessed" className="text-xs font-mono data-[state=active]:bg-slate-800 text-sky-400">
+                <Layers className="w-3.5 h-3.5 mr-1.5 text-sky-400" />
+                Pre-Processed Queue Inspector
+              </TabsTrigger>
               <TabsTrigger value="queue" className="text-xs font-mono data-[state=active]:bg-slate-800">
-                <Database className="w-3.5 h-3.5 mr-1.5 text-sky-400" />
+                <Database className="w-3.5 h-3.5 mr-1.5 text-slate-400" />
                 Preflight Batch Queue
               </TabsTrigger>
               <TabsTrigger value="profitability" className="text-xs font-mono data-[state=active]:bg-slate-800 text-emerald-400">
@@ -1533,7 +1964,9 @@ export default function BatchWorkspacePage() {
         </div>
       </div>
 
-      {activeTab === "profitability" ? (
+      {activeTab === "preprocessed" ? (
+        <PreProcessedQueueInspectorView addConsoleLog={addConsoleLog} />
+      ) : activeTab === "profitability" ? (
         <TargetProfitabilityMatrixView />
       ) : (
         <div className="flex flex-col gap-6">
