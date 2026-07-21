@@ -466,6 +466,111 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
   const [batchStatus, setBatchStatus] = useState<"RUNNING" | "STOPPED">("STOPPED")
   const [isControlling, setIsControlling] = useState(false)
 
+  // Runtime Config State
+  const [configMaxTokens, setConfigMaxTokens] = useState<number>(4096)
+  const [configConcurrency, setConfigConcurrency] = useState<number>(240)
+  const [configTemperature, setConfigTemperature] = useState<number>(0.0)
+  const [isSavingConfig, setIsSavingConfig] = useState<boolean>(false)
+
+  // Item Drawer State
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [activeFindingId, setActiveFindingId] = useState<string | null>(null)
+  const [itemDetails, setItemDetails] = useState<any | null>(null)
+  const [loadingItem, setLoadingItem] = useState(false)
+  const pollingRef = useRef<NodeJS.Timeout | null>(null)
+
+  const fetchRuntimeConfig = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_URL}/config`)
+      if (res.ok) {
+        const data = await res.json()
+        if (data.max_tokens !== undefined) setConfigMaxTokens(data.max_tokens)
+        if (data.concurrency_slots !== undefined) setConfigConcurrency(data.concurrency_slots)
+        if (data.temperature !== undefined) setConfigTemperature(data.temperature)
+      }
+    } catch (e) {
+      console.error("Failed to fetch runtime config:", e)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchRuntimeConfig()
+  }, [fetchRuntimeConfig])
+
+  const handleSaveRuntimeConfig = async () => {
+    setIsSavingConfig(true)
+    addConsoleLog(`Saving runtime config (max_tokens: ${configMaxTokens}, concurrency: ${configConcurrency}, temp: ${configTemperature})...`, "info")
+    try {
+      const res = await fetch(`${API_URL}/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          max_tokens: configMaxTokens,
+          concurrency_slots: configConcurrency,
+          temperature: configTemperature
+        })
+      })
+      if (res.ok) {
+        addConsoleLog("Runtime generation configuration saved successfully.", "info")
+      } else {
+        const err = await res.text()
+        addConsoleLog(`Failed to save runtime config: ${err}`, "error")
+      }
+    } catch (e) {
+      addConsoleLog(`Exception saving config: ${e}`, "error")
+    } finally {
+      setIsSavingConfig(false)
+    }
+  }
+
+  const fetchItemDetails = useCallback(async (findingId: string) => {
+    try {
+      const res = await fetch(`${API_URL}/batch/item/${findingId}`)
+      if (res.ok) {
+        const data = await res.json()
+        setItemDetails(data)
+        return data
+      }
+    } catch (e) {
+      console.error("Failed to fetch item details:", e)
+    }
+    return null
+  }, [])
+
+  const handleOpenItemDrawer = (findingId: string) => {
+    setActiveFindingId(findingId)
+    setDrawerOpen(true)
+    setLoadingItem(true)
+    setItemDetails(null)
+
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current)
+      pollingRef.current = null
+    }
+
+    fetchItemDetails(findingId).then((data) => {
+      setLoadingItem(false)
+      if (data && data.enrichment_status === "PENDING") {
+        pollingRef.current = setInterval(async () => {
+          const updated = await fetchItemDetails(findingId)
+          if (updated && updated.enrichment_status === "COMPLETED") {
+            if (pollingRef.current) {
+              clearInterval(pollingRef.current)
+              pollingRef.current = null
+            }
+          }
+        }, 3000)
+      }
+    })
+  }
+
+  useEffect(() => {
+    if (!drawerOpen && pollingRef.current) {
+      clearInterval(pollingRef.current)
+      pollingRef.current = null
+    }
+  }, [drawerOpen])
+
   // Debounce search query updates
   useEffect(() => {
     const handler = setTimeout(() => {
@@ -552,6 +657,59 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
 
   return (
     <div className="flex flex-col gap-6">
+      {/* 0. Generation Settings Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-4 bg-slate-950/80 border border-slate-800/90 p-3.5 rounded-xl backdrop-blur-xs shadow-inner">
+        <div className="flex items-center gap-2 font-mono text-xs text-slate-300">
+          <Sliders className="w-4 h-4 text-sky-400" />
+          <span className="font-bold uppercase tracking-wider text-slate-200">Runtime Generation Controls:</span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-4 text-xs font-mono">
+          <div className="flex items-center gap-2">
+            <span className="text-slate-400">Max Tokens:</span>
+            <Input
+              type="number"
+              value={configMaxTokens}
+              onChange={(e) => setConfigMaxTokens(Number(e.target.value))}
+              className="w-24 h-8 bg-slate-900 border-slate-800 text-slate-200 text-xs font-mono"
+            />
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-slate-400">Concurrency Slots:</span>
+            <Input
+              type="number"
+              value={configConcurrency}
+              onChange={(e) => setConfigConcurrency(Number(e.target.value))}
+              className="w-20 h-8 bg-slate-900 border-slate-800 text-slate-200 text-xs font-mono"
+            />
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-slate-400">Temperature:</span>
+            <Input
+              type="number"
+              step="0.05"
+              min="0"
+              max="1"
+              value={configTemperature}
+              onChange={(e) => setConfigTemperature(Number(e.target.value))}
+              className="w-20 h-8 bg-slate-900 border-slate-800 text-slate-200 text-xs font-mono"
+            />
+          </div>
+
+          <Button
+            size="sm"
+            className="bg-sky-600 hover:bg-sky-700 text-white font-mono flex items-center gap-1.5 h-8"
+            disabled={isSavingConfig}
+            onClick={handleSaveRuntimeConfig}
+          >
+            {isSavingConfig ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+            Save Generation Config
+          </Button>
+        </div>
+      </div>
+
       {/* Control Banner & Action Trigger */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-950/70 border border-slate-800/80 p-4 rounded-xl backdrop-blur-xs">
         <div className="flex items-center gap-3">
@@ -736,7 +894,11 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
                 </TableRow>
               ) : (
                 items.map((row, idx) => (
-                  <TableRow key={`${row.id}-${idx}`} className="hover:bg-slate-900/50 border-b border-slate-900/40">
+                  <TableRow
+                    key={`${row.id}-${idx}`}
+                    className="cursor-pointer hover:bg-slate-900/80 transition-colors border-b border-slate-900/40 select-none"
+                    onClick={() => handleOpenItemDrawer(row.id)}
+                  >
                     <TableCell className="text-slate-500 font-bold">{(page - 1) * limit + idx + 1}</TableCell>
                     <TableCell>
                       <div className="font-bold text-white text-xs truncate max-w-[240px]" title={row.id}>
@@ -833,6 +995,168 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
           </div>
         </div>
       </Card>
+
+      {/* 4. Item Inspection Drawer */}
+      <Sheet open={drawerOpen} onOpenChange={setDrawerOpen}>
+        <SheetContent className="bg-slate-950 border-l border-slate-800/80 w-full sm:max-w-2xl md:max-w-3xl overflow-y-auto p-6 font-sans text-slate-200">
+          <SheetHeader className="text-left border-b border-slate-900 pb-4">
+            <div className="flex items-center justify-between pr-8">
+              <SheetTitle className="text-base font-bold text-white font-mono flex items-center gap-2">
+                <Maximize2 className="w-4 h-4 text-sky-400" />
+                Inspection Drawer: {activeFindingId}
+              </SheetTitle>
+              {itemDetails && (
+                <Badge className={itemDetails.enrichment_status === "COMPLETED"
+                  ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-mono text-[10px]"
+                  : "bg-amber-500/20 text-amber-400 border border-amber-500/30 animate-pulse font-mono text-[10px]"}>
+                  {itemDetails.enrichment_status}
+                </Badge>
+              )}
+            </div>
+            <SheetDescription className="text-xs font-mono text-slate-400">
+              Payload inspection, prompt telemetry, and live enrichment results.
+            </SheetDescription>
+          </SheetHeader>
+
+          {loadingItem ? (
+            <div className="flex flex-col items-center justify-center py-20 text-slate-500 gap-3 font-mono">
+              <RefreshCw className="w-8 h-8 animate-spin text-sky-400" />
+              <span>Fetching finding item payload...</span>
+            </div>
+          ) : !itemDetails ? (
+            <div className="py-12 text-center text-slate-500 font-mono text-xs">
+              Failed to load finding item details.
+            </div>
+          ) : (
+            <Tabs defaultValue="user-prompt" className="mt-4">
+              <TabsList className="bg-slate-900 border border-slate-800 p-1 w-full justify-start font-mono text-xs">
+                <TabsTrigger value="user-prompt" className="data-[state=active]:bg-slate-800 data-[state=active]:text-sky-300">
+                  User Prompt
+                </TabsTrigger>
+                <TabsTrigger value="system-prompt" className="data-[state=active]:bg-slate-800 data-[state=active]:text-sky-300">
+                  System Prompt
+                </TabsTrigger>
+                <TabsTrigger value="http-payload" className="data-[state=active]:bg-slate-800 data-[state=active]:text-sky-300">
+                  HTTP Payload
+                </TabsTrigger>
+                <TabsTrigger value="live-response" className="data-[state=active]:bg-slate-800 data-[state=active]:text-sky-300">
+                  Live Response / Output
+                </TabsTrigger>
+              </TabsList>
+
+              {/* 1. User Prompt Tab */}
+              <TabsContent value="user-prompt" className="mt-4 flex flex-col gap-4 font-mono">
+                <div className="bg-slate-900/50 p-4 rounded-lg border border-slate-800 flex flex-col gap-2">
+                  <div className="text-[10px] text-slate-500 uppercase tracking-wider">User Prompt Payload</div>
+                  <pre className="font-mono text-xs text-slate-300 whitespace-pre-wrap break-words bg-slate-950 p-4 rounded border border-slate-900 max-h-[400px] overflow-y-auto leading-relaxed select-text">
+                    {itemDetails.user_prompt}
+                  </pre>
+                </div>
+              </TabsContent>
+
+              {/* 2. System Prompt Tab */}
+              <TabsContent value="system-prompt" className="mt-4 flex flex-col gap-4 font-mono">
+                <div className="bg-slate-900/50 p-4 rounded-lg border border-slate-800 flex flex-col gap-2">
+                  <div className="text-[10px] text-slate-500 uppercase tracking-wider">Static System Prompt & Active Taxonomy Guide</div>
+                  <pre className="font-mono text-xs text-slate-300 whitespace-pre-wrap break-words bg-slate-950 p-4 rounded border border-slate-900 max-h-[400px] overflow-y-auto leading-relaxed select-text">
+                    {itemDetails.system_prompt}
+                  </pre>
+                </div>
+              </TabsContent>
+
+              {/* 3. HTTP Payload Tab */}
+              <TabsContent value="http-payload" className="mt-4 flex flex-col gap-4 font-mono">
+                <div className="bg-slate-900/50 p-4 rounded-lg border border-slate-800 flex flex-col gap-2">
+                  <div className="text-[10px] text-slate-500 uppercase tracking-wider">Exact vLLM POST Request Payload</div>
+                  <PrettyJsonViewer data={itemDetails.request_payload} />
+                </div>
+              </TabsContent>
+
+              {/* 4. Live Response / Output Tab */}
+              <TabsContent value="live-response" className="mt-4 flex flex-col gap-4 font-mono">
+                {itemDetails.enrichment_status === "COMPLETED" && itemDetails.enriched_output ? (
+                  <div className="flex flex-col gap-4">
+                    {itemDetails.enriched_output.thinking_process && (
+                      <div className="bg-amber-950/20 border border-amber-900/40 p-4 rounded-lg">
+                        <span className="text-[10px] text-amber-400 font-bold uppercase tracking-wider block mb-1">
+                          Thinking Process / Reasoning
+                        </span>
+                        <p className="text-xs text-amber-200 leading-relaxed font-sans">
+                          {itemDetails.enriched_output.thinking_process}
+                        </p>
+                      </div>
+                    )}
+
+                    <div className="bg-slate-900/50 p-4 rounded-lg border border-slate-800 flex flex-col gap-3">
+                      <div>
+                        <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Vulnerability Summary</span>
+                        <p className="text-sm font-semibold text-white mt-1 font-sans">
+                          {itemDetails.enriched_output.vulnerability_summary || "N/A"}
+                        </p>
+                      </div>
+
+                      {itemDetails.enriched_output.root_cause_explanation && (
+                        <div>
+                          <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Root Cause Explanation</span>
+                          <p className="text-xs text-slate-300 mt-1 leading-relaxed font-sans">
+                            {itemDetails.enriched_output.root_cause_explanation}
+                          </p>
+                        </div>
+                      )}
+
+                      {itemDetails.enriched_output.attack_vector_steps?.length > 0 && (
+                        <div>
+                          <span className="text-[10px] text-slate-500 uppercase tracking-wider block mb-1">Attack Vector Steps</span>
+                          <ul className="list-disc list-inside text-xs text-slate-300 space-y-1 font-sans">
+                            {itemDetails.enriched_output.attack_vector_steps.map((step: string, sIdx: number) => (
+                              <li key={sIdx}>{step}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {itemDetails.enriched_output.preconditions?.length > 0 && (
+                        <div>
+                          <span className="text-[10px] text-slate-500 uppercase tracking-wider block mb-1">Preconditions</span>
+                          <ul className="list-disc list-inside text-xs text-slate-300 space-y-1 font-sans">
+                            {itemDetails.enriched_output.preconditions.map((prec: string, pIdx: number) => (
+                              <li key={pIdx}>{prec}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {itemDetails.enriched_output.remediation_pattern && (
+                        <div>
+                          <span className="text-[10px] text-slate-500 uppercase tracking-wider block mb-1">Remediation Pattern</span>
+                          <p className="text-xs text-emerald-300 font-sans leading-relaxed bg-emerald-950/20 p-2.5 rounded border border-emerald-900/40">
+                            {itemDetails.enriched_output.remediation_pattern}
+                          </p>
+                        </div>
+                      )}
+
+                      <div className="pt-2">
+                        <span className="text-[10px] text-slate-500 uppercase tracking-wider block mb-1">Formatted Raw Output JSON</span>
+                        <PrettyJsonViewer data={itemDetails.enriched_output} />
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center py-16 bg-slate-900/30 border border-slate-800/80 rounded-xl gap-3 text-center">
+                    <RefreshCw className="w-8 h-8 animate-spin text-amber-400" />
+                    <div className="text-amber-400 font-bold text-sm tracking-wide">
+                      Enrichment Status: PENDING
+                    </div>
+                    <p className="text-xs text-slate-400 max-w-sm leading-relaxed">
+                      This queue item is awaiting GPU inference worker dispatch. Real-time background polling is active...
+                    </p>
+                  </div>
+                )}
+              </TabsContent>
+            </Tabs>
+          )}
+        </SheetContent>
+      </Sheet>
     </div>
   )
 }

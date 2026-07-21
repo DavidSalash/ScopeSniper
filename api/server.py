@@ -24,6 +24,7 @@ from core.pipeline import (
     set_cancellation_flag,
     REFUSAL_GUARD_TEXT
 )
+from core.batch_enricher import _get_active_taxonomy_guide
 from core.ingest_source_dbs import run_full_source_ingestion
 from core.tracker import run_state_differential_tracker_loop
 
@@ -612,7 +613,169 @@ def batch_control(payload: Optional[Dict[str, Any]] = Body(None), action: Option
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action '{req_action}'. Valid actions: start, pause, status.")
 
+@app.get("/api/batch/item/{finding_id:path}")
+def get_batch_item(finding_id: str):
+    """
+    Constructs and returns full prompt details, request payload, enrichment status,
+    and completed output for a given finding_id.
+    """
+    conn = get_unified_connection()
+    try:
+        from core.database import attach_vulnerabilities_db
+        attach_vulnerabilities_db(conn)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT id, source_pool, protocol_name, source_repo, title, content_markdown, severity 
+            FROM vuln.normalized_findings 
+            WHERE id = ?
+        """, (finding_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Finding ID '{finding_id}' not found in normalized_findings.")
+
+        finding = dict(row)
+        title = finding.get("title", "") or finding_id
+        severity = finding.get("severity", "high")
+        content_markdown = finding.get("content_markdown", "") or ""
+
+        # Fetch completed enrichment output if present
+        cursor.execute("""
+            SELECT taxonomy_path, vulnerability_summary, root_cause_explanation,
+                   attack_vector_steps_json, preconditions_json, impact_scope,
+                   affected_constructs_json, remediation_pattern, processed_at
+            FROM vuln.enriched_findings_metadata
+            WHERE finding_id = ?
+        """, (finding_id,))
+        enrich_row = cursor.fetchone()
+
+        enrichment_status = "COMPLETED" if enrich_row else "PENDING"
+        enriched_output = None
+
+        if enrich_row:
+            e_dict = dict(enrich_row)
+            def safe_parse_json(val):
+                if not val:
+                    return []
+                try:
+                    return json.loads(val)
+                except Exception:
+                    return [val]
+
+            enriched_output = {
+                "taxonomy_path": e_dict.get("taxonomy_path"),
+                "vulnerability_summary": e_dict.get("vulnerability_summary"),
+                "root_cause_explanation": e_dict.get("root_cause_explanation"),
+                "attack_vector_steps": safe_parse_json(e_dict.get("attack_vector_steps_json")),
+                "preconditions": safe_parse_json(e_dict.get("preconditions_json")),
+                "impact_scope": e_dict.get("impact_scope"),
+                "affected_solidity_constructs": safe_parse_json(e_dict.get("affected_constructs_json")),
+                "remediation_pattern": e_dict.get("remediation_pattern"),
+                "thinking_process": f"Evaluated audit report for {finding.get('protocol_name', 'target protocol')} with {severity} severity impact.",
+                "processed_at": e_dict.get("processed_at")
+            }
+
+        # Build taxonomy guide and prompts
+        try:
+            taxonomy_guide = _get_active_taxonomy_guide(conn)
+        except Exception:
+            taxonomy_guide = []
+
+        prompt_cfg = {}
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    prompt_cfg = json.load(f)
+            except Exception:
+                pass
+
+        default_path = taxonomy_guide[0]["path"] if taxonomy_guide else "smart_contract/reentrancy/read_only/view_desync"
+
+        system_prompt = (
+            "You are an expert smart contract security auditor and AI trainer. "
+            "Classify the input finding into our vulnerability taxonomy and extract rich structured metadata.\n"
+            f"Valid active taxonomy guide: {json.dumps(taxonomy_guide)}\n"
+            "IMPORTANT CONSTRAINTS:\n"
+            "1. You MUST select a 'taxonomy_path' strictly present in the valid active taxonomy guide above.\n"
+            "2. Keep 'thinking_process' concise (1-2 sentences) so output fits within token budget.\n"
+            "3. The array fields ('attack_vector_steps', 'preconditions', 'affected_solidity_constructs') MUST ALWAYS be non-empty lists with at least 1 string element.\n\n"
+            "Output ONLY a valid JSON object strictly matching this payload schema:\n"
+            "{\n"
+            '  "thinking_process": "<brief 1-2 sentence step-by-step reasoning about the finding>",\n'
+            '  "taxonomy_slug": "view_desync",\n'
+            f'  "taxonomy_path": "{default_path}",\n'
+            '  "confidence_score": 0.95,\n'
+            '  "vulnerability_summary": "<summary>",\n'
+            '  "root_cause_explanation": "<root cause>",\n'
+            '  "attack_vector_steps": ["step 1", "step 2"],\n'
+            '  "preconditions": ["precondition 1"],\n'
+            '  "impact_scope": "direct_theft_of_user_funds",\n'
+            '  "affected_solidity_constructs": ["view_function", "external_call"],\n'
+            '  "remediation_pattern": "<remediation>"\n'
+            "}"
+        )
+
+        user_prompt = f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content_markdown}"
+
+        request_payload = {
+            "model": prompt_cfg.get("model_name", "Kbenkhaled/Qwen3.5-9B-NVFP4"),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": prompt_cfg.get("temperature", 0.0),
+            "max_tokens": prompt_cfg.get("max_tokens", 4096),
+            "response_format": {"type": "json_object"}
+        }
+
+        return {
+            "status": "success",
+            "finding_id": finding_id,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "request_payload": request_payload,
+            "enrichment_status": enrichment_status,
+            "enriched_output": enriched_output
+        }
+    finally:
+        conn.close()
+
+@app.get("/api/config")
+def get_config():
+    """GET current runtime configuration from config/prompt_config.json."""
+    if not CONFIG_FILE.exists():
+        raise HTTPException(status_code=404, detail="prompt_config.json not found")
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading config: {str(e)}")
+
+@app.post("/api/config")
+def update_config(payload: Dict[str, Any] = Body(...)):
+    """POST dynamic update to fields in config/prompt_config.json (max_tokens, concurrency_slots, temperature, etc.)."""
+    current_config = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                current_config = json.load(f)
+        except Exception:
+            pass
+
+    for key in ["max_tokens", "concurrency_slots", "temperature", "vllm_endpoint", "model_name"]:
+        if key in payload:
+            current_config[key] = payload[key]
+
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(current_config, f, indent=2)
+        return {"status": "success", "config": current_config}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating config: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api.server:app", host="0.0.0.0", port=10000, reload=True)
+
 

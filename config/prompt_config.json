@@ -11,7 +11,8 @@
   },
   "refusal_prompt": "IMPORTANT INSTRUCTION: If the input provided above does not contain valid source code or relevant data for your analysis task, or if you cannot extract the requested information because it is simply not present in the input, respond with exactly the words 'invalid input' at the end of your response. Do not attempt to fabricate, hallucinate, or infer information that is not present in the input.",
   "max_tokens": 4096,
-  "concurrency_slots": 32,
+  "concurrency_slots": 240,
+  "temperature": 0.1,
   "vllm_endpoint": "http://192.168.1.57:8000/v1/chat/completions",
   "model_name": "Kbenkhaled/Qwen3.5-9B-NVFP4",
   "token_bucket_tiers": [
