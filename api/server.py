@@ -694,9 +694,8 @@ async def export_compact_batch(
 
             title = raw_item.get("title", "")
             severity = raw_item.get("severity", "")
-            content = raw_item.get("content_snippet", "") or raw_item.get("content_markdown", "")
-            raw_user_prompt = raw_item.get("user_prompt") or f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content}"
-            truncated_prompt = raw_user_prompt[:500]
+            content = raw_item.get("content_markdown", "") or raw_item.get("content_snippet", "")
+            full_user_prompt = raw_item.get("user_prompt") or f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content}"
 
             item_export: Dict[str, Any] = {
                 "id": fid,
@@ -707,8 +706,8 @@ async def export_compact_batch(
                 "total_tokens": raw_item.get("total_tokens", 0),
                 "context_tier": t_key,
                 "enrichment_status": enrichment_status,
-                "user_prompt": truncated_prompt,
-                "user_prompt_snippet": truncated_prompt
+                "user_prompt": full_user_prompt,
+                "user_prompt_snippet": full_user_prompt
             }
 
             if enrichment_status == "COMPLETED":

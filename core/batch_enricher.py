@@ -99,7 +99,7 @@ def process_single_finding_enrichment(
         "}"
     )
 
-    user_prompt = f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content[:2000]}"
+    user_prompt = f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content}"
     raw_input_prompt = f"System:\n{system_prompt}\n\nUser:\n{user_prompt}"
 
     payload = {

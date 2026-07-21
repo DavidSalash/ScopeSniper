@@ -115,10 +115,7 @@ def run_offline_queue_preprocessing() -> Dict[str, Any]:
     # 3. Process each finding: calculate token length & bucket
     ignored_stubs_count = 0
     STUB_PATTERNS = [
-        "Duplicate of #",
-        "Contained in report",
-        "QA Report",
-        "Gas Optimizations"
+        "Duplicate of #"
     ]
 
     for idx, f in enumerate(unprocessed_findings):
@@ -126,8 +123,8 @@ def run_offline_queue_preprocessing() -> Dict[str, Any]:
         content = f.get("content_markdown", "") or ""
         content_stripped = content.strip()
 
-        # Quality & Stub Filter Criteria
-        if len(content_stripped) < 150:
+        # Pure empty / redirect noise filter criteria
+        if len(content_stripped) < 50:
             ignored_stubs_count += 1
             continue
 
@@ -138,7 +135,7 @@ def run_offline_queue_preprocessing() -> Dict[str, Any]:
 
         severity = f.get("severity", "high")
 
-        user_prompt = f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content[:2000]}"
+        user_prompt = f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content}"
         user_prompt_token_count = count_tokens(user_prompt)
 
         total_tokens = system_prompt_token_count + user_prompt_token_count
@@ -152,6 +149,7 @@ def run_offline_queue_preprocessing() -> Dict[str, Any]:
             "system_prompt_tokens": system_prompt_token_count,
             "user_prompt_tokens": user_prompt_token_count,
             "total_tokens": total_tokens,
+            "user_prompt": user_prompt,
             "content_snippet": content[:500]
         }
 
