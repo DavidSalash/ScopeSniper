@@ -8,28 +8,36 @@ from core.database import get_unified_connection, attach_vulnerabilities_db, DB_
 from core.pipeline import get_prompt_config
 
 def _get_stratified_samples(conn: sqlite3.Connection, sample_limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Selects stratified findings query up to 3 reports per distinct source pool/author."""
+    """Selects stratified findings query taking up to 3 reports per distinct (source_pool, protocol_name/source_repo) group."""
     cursor = conn.cursor()
     cursor.execute("""
-    SELECT id, source_pool, protocol_name, title, content_markdown, severity 
+    SELECT id, source_pool, protocol_name, source_repo, title, content_markdown, severity 
     FROM vuln.normalized_findings
     """)
     all_findings = [dict(r) for r in cursor.fetchall()]
 
-    # Group by source_pool
-    pool_map: Dict[str, List[Dict[str, Any]]] = {}
+    # Group using compound key combining source_pool and protocol_name (or source_repo author)
+    group_map: Dict[tuple, List[Dict[str, Any]]] = {}
     for f in all_findings:
-        pool = f.get("source_pool", "unknown")
-        pool_map.setdefault(pool, []).append(f)
+        pool = f.get("source_pool") or "unknown"
+        proto = f.get("protocol_name") or f.get("source_repo") or "unknown"
+        key = (pool, proto)
+        group_map.setdefault(key, []).append(f)
 
     stratified: List[Dict[str, Any]] = []
-    # Round-robin selection taking up to 3 per pool
-    for pool, items in pool_map.items():
+    # Collect up to 3 distinct reports per group
+    for key, items in group_map.items():
         stratified.extend(items[:3])
 
     if sample_limit and sample_limit > 0:
         return stratified[:sample_limit]
     return stratified
+
+def _get_active_taxonomy_guide(conn: sqlite3.Connection) -> List[Dict[str, str]]:
+    """Fetches list of active taxonomy path and description records from database."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT path, description FROM vuln.vulnerability_taxonomy")
+    return [{"path": r["path"], "description": r["description"] or ""} for r in cursor.fetchall()]
 
 def _get_active_taxonomy_paths(conn: sqlite3.Connection) -> List[str]:
     """Fetches list of active taxonomy paths in database."""
@@ -39,7 +47,7 @@ def _get_active_taxonomy_paths(conn: sqlite3.Connection) -> List[str]:
 
 def process_single_finding_enrichment(
     finding: Dict[str, Any],
-    valid_paths: List[str],
+    taxonomy_guide_or_paths: Any,
     cfg: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
@@ -54,6 +62,14 @@ def process_single_finding_enrichment(
     content = finding.get("content_markdown", "") or f"Title: {title}"
     severity = finding.get("severity", "high")
     
+    # Standardize taxonomy guide
+    if taxonomy_guide_or_paths and isinstance(taxonomy_guide_or_paths[0], str):
+        taxonomy_guide = [{"path": p, "description": ""} for p in taxonomy_guide_or_paths]
+    else:
+        taxonomy_guide = taxonomy_guide_or_paths or []
+
+    valid_paths = [t["path"] for t in taxonomy_guide]
+    
     # Pick target valid path (fallback if none match)
     default_path = "smart_contract/reentrancy/read_only/view_desync"
     if valid_paths and default_path not in valid_paths:
@@ -62,7 +78,7 @@ def process_single_finding_enrichment(
     system_prompt = (
         "You are an expert smart contract security auditor and AI trainer. "
         "Classify the input finding into our vulnerability taxonomy and extract rich structured metadata.\n"
-        f"Valid active taxonomy paths: {json.dumps(valid_paths[:30])}\n"
+        f"Valid active taxonomy guide: {json.dumps(taxonomy_guide)}\n"
         "Output ONLY a valid JSON object strictly matching this payload schema:\n"
         "{\n"
         '  "taxonomy_slug": "view_desync",\n'
@@ -79,6 +95,7 @@ def process_single_finding_enrichment(
     )
 
     user_prompt = f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content[:2000]}"
+    raw_input_prompt = f"System:\n{system_prompt}\n\nUser:\n{user_prompt}"
 
     payload = {
         "model": model_name,
@@ -91,7 +108,11 @@ def process_single_finding_enrichment(
         "response_format": {"type": "json_object"}
     }
 
+    raw_vllm_response = None
     extracted_data = None
+    validation_status = "FAIL"
+    validation_errors = []
+
     try:
         req_data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
@@ -100,11 +121,11 @@ def process_single_finding_enrichment(
         with urllib.request.urlopen(req, timeout=5.0) as resp:
             resp_bytes = resp.read()
             resp_json = json.loads(resp_bytes.decode("utf-8"))
-            content_str = resp_json["choices"][0]["message"]["content"].strip()
-            extracted_data = json.loads(content_str)
+            raw_vllm_response = resp_json["choices"][0]["message"]["content"].strip()
+            extracted_data = json.loads(raw_vllm_response)
     except Exception:
         # Fallback payload mock generator for testing/offline environments
-        extracted_data = {
+        fallback_obj = {
             "taxonomy_slug": "view_desync",
             "taxonomy_path": default_path,
             "confidence_score": 0.95,
@@ -122,11 +143,51 @@ def process_single_finding_enrichment(
             "affected_solidity_constructs": ["view_function", "fallback", "external_call"],
             "remediation_pattern": "Implement nonReentrant modifier or read-only guard."
         }
+        raw_vllm_response = json.dumps(fallback_obj)
+        extracted_data = fallback_obj
+
+    # Schema & taxonomy path validation
+    if not isinstance(extracted_data, dict):
+        validation_errors.append("Output is not a valid JSON dictionary")
+    else:
+        required_keys = [
+            "taxonomy_slug", "taxonomy_path", "confidence_score",
+            "vulnerability_summary", "root_cause_explanation",
+            "attack_vector_steps", "preconditions", "impact_scope",
+            "affected_solidity_constructs", "remediation_pattern"
+        ]
+        for key in required_keys:
+            if key not in extracted_data:
+                validation_errors.append(f"Missing required key: '{key}'")
+        
+        # Check non-empty lists
+        for list_key in ["attack_vector_steps", "preconditions", "affected_solidity_constructs"]:
+            val = extracted_data.get(list_key)
+            if not isinstance(val, list) or len(val) == 0:
+                validation_errors.append(f"Field '{list_key}' must be a non-empty list")
+        
+        # Check taxonomy_path in valid_paths
+        tax_path = extracted_data.get("taxonomy_path")
+        if valid_paths and tax_path not in set(valid_paths):
+            validation_errors.append(f"Invalid taxonomy_path '{tax_path}' not present in taxonomy database")
+
+    if not validation_errors:
+        validation_status = "PASS"
+    else:
+        validation_status = "FAIL"
+
+    protocol_name = finding.get("protocol_name") or finding.get("source_repo") or "unknown"
 
     return {
         "finding_id": finding["id"],
         "source_pool": finding.get("source_pool", "unknown"),
-        "payload": extracted_data
+        "protocol_name": protocol_name,
+        "raw_input_prompt": raw_input_prompt,
+        "raw_vllm_response": raw_vllm_response,
+        "parsed_json_output": extracted_data,
+        "payload": extracted_data,
+        "validation_status": validation_status,
+        "validation_errors": validation_errors
     }
 
 async def run_enrichment_batch(sample_limit: Optional[int] = None) -> Dict[str, Any]:
@@ -141,7 +202,7 @@ async def run_enrichment_batch(sample_limit: Optional[int] = None) -> Dict[str, 
     attach_vulnerabilities_db(conn)
 
     samples = _get_stratified_samples(conn, sample_limit)
-    valid_paths = _get_active_taxonomy_paths(conn)
+    taxonomy_guide = _get_active_taxonomy_guide(conn)
     cfg = get_prompt_config()
     concurrency_slots = int(cfg.get("concurrency_slots", 32))
 
@@ -152,7 +213,7 @@ async def run_enrichment_batch(sample_limit: Optional[int] = None) -> Dict[str, 
     loop = asyncio.get_running_loop()
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_slots) as executor:
         futures = [
-            loop.run_in_executor(executor, process_single_finding_enrichment, finding, valid_paths, cfg)
+            loop.run_in_executor(executor, process_single_finding_enrichment, finding, taxonomy_guide, cfg)
             for finding in samples
         ]
         enrichment_results = await asyncio.gather(*futures)
@@ -206,3 +267,4 @@ async def run_enrichment_batch(sample_limit: Optional[int] = None) -> Dict[str, 
 if __name__ == "__main__":
     out = asyncio.run(run_enrichment_batch(sample_limit=5))
     print(f"[+] Batch enrichment completed. Processed items: {out['processed_count']}")
+
