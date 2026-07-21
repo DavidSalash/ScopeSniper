@@ -16,6 +16,8 @@ import {
   Terminal, 
   Database,
   ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
   Filter,
   Play,
   Download,
@@ -462,6 +464,18 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
   const [debouncedSearch, setDebouncedSearch] = useState("")
   const [loading, setLoading] = useState(true)
   const [selectedItemIds, setSelectedItemIds] = useState<string[]>([])
+  const [sortBy, setSortBy] = useState<string>("tokens")
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc")
+
+  const handleSort = (field: string) => {
+    if (sortBy === field) {
+      setSortOrder(prev => (prev === "asc" ? "desc" : "asc"))
+    } else {
+      setSortBy(field)
+      setSortOrder(field === "tokens" || field === "severity" ? "desc" : "asc")
+    }
+    setPage(1)
+  }
 
   // Control State
   const [batchStatus, setBatchStatus] = useState<"RUNNING" | "STOPPED">("STOPPED")
@@ -609,6 +623,8 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
       params.append("limit", limit.toString())
       if (selectedTier) params.append("tier", selectedTier)
       if (debouncedSearch.trim()) params.append("search", debouncedSearch.trim())
+      if (sortBy) params.append("sort_by", sortBy)
+      if (sortOrder) params.append("sort_order", sortOrder)
 
       const res = await fetch(`${API_URL}/batch/queue?${params.toString()}`)
       if (res.ok) {
@@ -625,7 +641,7 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
     } finally {
       setLoading(false)
     }
-  }, [page, limit, selectedTier, debouncedSearch, addConsoleLog])
+  }, [page, limit, selectedTier, debouncedSearch, sortBy, sortOrder, addConsoleLog])
 
   const checkBatchStatus = useCallback(async () => {
     try {
@@ -641,7 +657,7 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
 
   useEffect(() => {
     fetchPreprocessedQueue(items.length === 0)
-  }, [page, limit, selectedTier, debouncedSearch])
+  }, [page, limit, selectedTier, debouncedSearch, sortBy, sortOrder])
 
   useEffect(() => {
     checkBatchStatus()
@@ -682,7 +698,7 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
         const res = await fetch(`${API_URL}/batch/export`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ids: selectedItemIds, download: false })
+          body: JSON.stringify({ ids: selectedItemIds, sort_by: sortBy, sort_order: sortOrder, download: false })
         })
         if (res.ok) {
           const data = await res.json()
@@ -706,6 +722,8 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
     } else {
       const params = new URLSearchParams()
       if (selectedTier) params.append("tier", selectedTier)
+      if (sortBy) params.append("sort_by", sortBy)
+      if (sortOrder) params.append("sort_order", sortOrder)
       params.append("download", "true")
       const exportUrl = `${API_URL}/batch/export?${params.toString()}`
 
@@ -713,6 +731,52 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
       const a = document.createElement("a")
       a.href = exportUrl
       a.download = "preprocessed_queue_export.json"
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+    }
+  }
+
+  const handleExportSimplifiedJson = async () => {
+    if (selectedItemIds.length > 0) {
+      addConsoleLog(`Initiating simplified JSON export (title & user_prompt_snippet) for ${selectedItemIds.length} items...`, "info")
+      try {
+        const res = await fetch(`${API_URL}/batch/export-simplified`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ids: selectedItemIds, sort_by: sortBy, sort_order: sortOrder, download: false })
+        })
+        if (res.ok) {
+          const data = await res.json()
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })
+          const url = URL.createObjectURL(blob)
+          const a = document.createElement("a")
+          a.href = url
+          a.download = "simplified_queue_export.json"
+          document.body.appendChild(a)
+          a.click()
+          document.body.removeChild(a)
+          URL.revokeObjectURL(url)
+          addConsoleLog(`Successfully exported ${selectedItemIds.length} items to simplified_queue_export.json`, "info")
+        } else {
+          const errText = await res.text()
+          addConsoleLog(`Failed to export simplified items: ${errText}`, "error")
+        }
+      } catch (e) {
+        addConsoleLog(`Exception during simplified export: ${e}`, "error")
+      }
+    } else {
+      const params = new URLSearchParams()
+      if (selectedTier) params.append("tier", selectedTier)
+      if (sortBy) params.append("sort_by", sortBy)
+      if (sortOrder) params.append("sort_order", sortOrder)
+      params.append("download", "true")
+      const exportUrl = `${API_URL}/batch/export-simplified?${params.toString()}`
+
+      addConsoleLog(`Initiating simplified JSON export download: ${exportUrl}`, "info")
+      const a = document.createElement("a")
+      a.href = exportUrl
+      a.download = "simplified_queue_export.json"
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
@@ -846,6 +910,16 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
             <Download className="w-3.5 h-3.5 mr-1.5 text-emerald-400" />
             {selectedItemIds.length > 0 ? `Export Selected (${selectedItemIds.length})` : "Export Compact JSON"}
           </Button>
+
+          <Button
+            variant="outline"
+            size="sm"
+            className="border-slate-800 hover:bg-slate-900 bg-slate-950 text-sky-300 hover:text-sky-200 h-9 font-mono"
+            onClick={handleExportSimplifiedJson}
+          >
+            <FileCode className="w-3.5 h-3.5 mr-1.5 text-sky-400" />
+            Export Simplified
+          </Button>
         </div>
       </div>
 
@@ -927,6 +1001,30 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
                 />
               </div>
 
+              {/* Sort Selector Dropdown */}
+              <div className="flex items-center gap-1.5 text-xs text-slate-400 font-mono bg-slate-900/30 border border-slate-800/50 rounded px-2.5 py-1">
+                <ArrowUpDown className="w-3.5 h-3.5 text-slate-500" />
+                <span className="text-slate-500">SORT:</span>
+                <select
+                  value={`${sortBy}:${sortOrder}`}
+                  onChange={(e) => {
+                    const [b, o] = e.target.value.split(":")
+                    setSortBy(b)
+                    setSortOrder(o as "asc" | "desc")
+                    setPage(1)
+                  }}
+                  className="bg-transparent text-sky-400 font-semibold text-[11px] focus:outline-none cursor-pointer"
+                >
+                  <option value="tokens:desc" className="bg-slate-950 text-slate-200">Token Count (High → Low)</option>
+                  <option value="tokens:asc" className="bg-slate-950 text-slate-200">Token Count (Low → High)</option>
+                  <option value="id:asc" className="bg-slate-950 text-slate-200">Finding ID (A → Z)</option>
+                  <option value="id:desc" className="bg-slate-950 text-slate-200">Finding ID (Z → A)</option>
+                  <option value="protocol:asc" className="bg-slate-950 text-slate-200">Protocol (A → Z)</option>
+                  <option value="severity:desc" className="bg-slate-950 text-slate-200">Severity (High → Low)</option>
+                  <option value="status:asc" className="bg-slate-950 text-slate-200">Status (Pending → Completed)</option>
+                </select>
+              </div>
+
               {/* Tier Filter Pills */}
               <div className="flex items-center gap-1.5 text-xs text-slate-400 font-mono bg-slate-900/30 border border-slate-800/50 rounded px-2.5 py-1">
                 <Filter className="w-3.5 h-3.5 text-slate-500" />
@@ -970,12 +1068,37 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
                   />
                 </TableHead>
                 <TableHead className="w-12 text-slate-400">#</TableHead>
-                <TableHead className="w-64 text-slate-400">Finding ID</TableHead>
-                <TableHead className="w-32 text-slate-400">Source Pool</TableHead>
-                <TableHead className="w-48 text-slate-400">Protocol / Repo</TableHead>
-                <TableHead className="w-36 text-slate-400">Token Count</TableHead>
+                <TableHead className="w-64 text-slate-400 cursor-pointer hover:text-white transition-colors" onClick={() => handleSort("id")}>
+                  <div className="flex items-center gap-1">
+                    Finding ID
+                    {sortBy === "id" ? (sortOrder === "asc" ? <ArrowUp className="w-3 h-3 text-sky-400" /> : <ArrowDown className="w-3 h-3 text-sky-400" />) : <ArrowUpDown className="w-3 h-3 opacity-40" />}
+                  </div>
+                </TableHead>
+                <TableHead className="w-32 text-slate-400 cursor-pointer hover:text-white transition-colors" onClick={() => handleSort("source_pool")}>
+                  <div className="flex items-center gap-1">
+                    Source Pool
+                    {sortBy === "source_pool" ? (sortOrder === "asc" ? <ArrowUp className="w-3 h-3 text-sky-400" /> : <ArrowDown className="w-3 h-3 text-sky-400" />) : <ArrowUpDown className="w-3 h-3 opacity-40" />}
+                  </div>
+                </TableHead>
+                <TableHead className="w-48 text-slate-400 cursor-pointer hover:text-white transition-colors" onClick={() => handleSort("protocol")}>
+                  <div className="flex items-center gap-1">
+                    Protocol / Repo
+                    {sortBy === "protocol" ? (sortOrder === "asc" ? <ArrowUp className="w-3 h-3 text-sky-400" /> : <ArrowDown className="w-3 h-3 text-sky-400" />) : <ArrowUpDown className="w-3 h-3 opacity-40" />}
+                  </div>
+                </TableHead>
+                <TableHead className="w-36 text-slate-400 cursor-pointer hover:text-white transition-colors" onClick={() => handleSort("tokens")}>
+                  <div className="flex items-center gap-1">
+                    Token Count
+                    {sortBy === "tokens" ? (sortOrder === "asc" ? <ArrowUp className="w-3 h-3 text-sky-400" /> : <ArrowDown className="w-3 h-3 text-sky-400" />) : <ArrowUpDown className="w-3 h-3 opacity-40" />}
+                  </div>
+                </TableHead>
                 <TableHead className="w-36 text-slate-400">Context Tier</TableHead>
-                <TableHead className="w-36 text-slate-400">Enrichment Status</TableHead>
+                <TableHead className="w-36 text-slate-400 cursor-pointer hover:text-white transition-colors" onClick={() => handleSort("status")}>
+                  <div className="flex items-center gap-1">
+                    Enrichment Status
+                    {sortBy === "status" ? (sortOrder === "asc" ? <ArrowUp className="w-3 h-3 text-sky-400" /> : <ArrowDown className="w-3 h-3 text-sky-400" />) : <ArrowUpDown className="w-3 h-3 opacity-40" />}
+                  </div>
+                </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody className="text-xs divide-y divide-slate-900/60 font-mono">

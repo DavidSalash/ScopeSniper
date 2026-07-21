@@ -113,9 +113,29 @@ def run_offline_queue_preprocessing() -> Dict[str, Any]:
     }
 
     # 3. Process each finding: calculate token length & bucket
+    ignored_stubs_count = 0
+    STUB_PATTERNS = [
+        "Duplicate of #",
+        "Contained in report",
+        "QA Report",
+        "Gas Optimizations"
+    ]
+
     for idx, f in enumerate(unprocessed_findings):
         title = f.get("title", "Vulnerability Finding")
-        content = f.get("content_markdown", "") or f"Title: {title}"
+        content = f.get("content_markdown", "") or ""
+        content_stripped = content.strip()
+
+        # Quality & Stub Filter Criteria
+        if len(content_stripped) < 150:
+            ignored_stubs_count += 1
+            continue
+
+        content_lower = content_stripped.lower()
+        if any(pattern.lower() in content_lower for pattern in STUB_PATTERNS):
+            ignored_stubs_count += 1
+            continue
+
         severity = f.get("severity", "high")
 
         user_prompt = f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content[:2000]}"
@@ -145,9 +165,9 @@ def run_offline_queue_preprocessing() -> Dict[str, Any]:
         else:
             buckets["greater_than_4k"].append(item)
 
-    # 4. Sort sequences within each bucket by sequence length to minimize vLLM padding overhead
+    # 4. Sort sequences within each bucket descending by user prompt token count
     for bucket_name in buckets:
-        buckets[bucket_name].sort(key=lambda x: x["total_tokens"])
+        buckets[bucket_name].sort(key=lambda x: x["user_prompt_tokens"], reverse=True)
 
     summary_counts = {tier: len(items) for tier, items in buckets.items()}
     total_staged = sum(summary_counts.values())
@@ -155,6 +175,7 @@ def run_offline_queue_preprocessing() -> Dict[str, Any]:
     report = {
         "timestamp": os.getenv("CURRENT_TIMESTAMP", ""),
         "total_unprocessed_findings": len(unprocessed_findings),
+        "ignored_stubs_count": ignored_stubs_count,
         "total_staged": total_staged,
         "tokenizer_used": TOKENIZER_TYPE,
         "system_prompt_static_tokens": system_prompt_token_count,
@@ -167,6 +188,9 @@ def run_offline_queue_preprocessing() -> Dict[str, Any]:
         json.dump(report, f, indent=2)
 
     print(f"[+] Offline token pre-processing complete.")
+    print(f"[+] Total unprocessed findings fetched: {len(unprocessed_findings)}")
+    print(f"[+] Ignored low-quality stub entries: {ignored_stubs_count}")
+    print(f"[+] Valid substantive findings staged: {total_staged}")
     print(f"[+] Tokenizer used: {TOKENIZER_TYPE}")
     print(f"[+] Bucket breakdown: {json.dumps(summary_counts, indent=2)}")
     print(f"[+] Exported telemetry log to: {QUEUE_DISTRIBUTION_FILE}")
@@ -174,6 +198,8 @@ def run_offline_queue_preprocessing() -> Dict[str, Any]:
     return {
         "status": "success",
         "total_unprocessed": len(unprocessed_findings),
+        "ignored_stubs_count": ignored_stubs_count,
+        "total_staged": total_staged,
         "summary_counts": summary_counts,
         "queue_distribution_file": str(QUEUE_DISTRIBUTION_FILE)
     }

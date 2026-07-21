@@ -460,12 +460,15 @@ def get_batch_queue(
     page: int = 1,
     limit: int = 50,
     tier: Optional[str] = None,
-    search: Optional[str] = None
+    search: Optional[str] = None,
+    sort_by: Optional[str] = "tokens",
+    sort_order: Optional[str] = "desc"
 ):
     """
     Exposes pre-processed requests from audit_logs/queue_distribution.json
     with live status attached from vuln.enriched_findings_metadata.
-    Supports tier filtering and text search over id, protocol_name, title, source_pool.
+    Supports tier filtering, text search over id, protocol_name, title, source_pool,
+    and sorting by tokens, finding ID, title, severity, protocol, source_pool, or status.
     """
     queue_data = load_queue_distribution()
     total_staged = queue_data.get("total_staged") or queue_data.get("total_unprocessed_findings") or 0
@@ -522,6 +525,26 @@ def get_batch_queue(
                 filtered.append(item)
         staged_items = filtered
 
+    # Apply sorting if provided
+    if sort_by:
+        sb = sort_by.lower()
+        reverse = (sort_order.lower() == "desc") if sort_order else True
+        if sb in ["tokens", "total_tokens", "user_prompt_tokens"]:
+            staged_items.sort(key=lambda x: (x.get("user_prompt_tokens") or x.get("total_tokens") or 0), reverse=reverse)
+        elif sb in ["id", "finding_id"]:
+            staged_items.sort(key=lambda x: str(x.get("id") or "").lower(), reverse=reverse)
+        elif sb == "title":
+            staged_items.sort(key=lambda x: str(x.get("title") or "").lower(), reverse=reverse)
+        elif sb == "severity":
+            sev_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+            staged_items.sort(key=lambda x: sev_rank.get(str(x.get("severity") or "").lower(), 0), reverse=reverse)
+        elif sb in ["protocol", "protocol_name"]:
+            staged_items.sort(key=lambda x: str(x.get("protocol_name") or "").lower(), reverse=reverse)
+        elif sb in ["source_pool", "pool"]:
+            staged_items.sort(key=lambda x: str(x.get("source_pool") or "").lower(), reverse=reverse)
+        elif sb in ["status", "enrichment_status"]:
+            staged_items.sort(key=lambda x: str(x.get("enrichment_status") or "").lower(), reverse=reverse)
+
     total_matching = len(staged_items)
 
     # Apply pagination
@@ -536,6 +559,8 @@ def get_batch_queue(
         "total_staged": total_staged,
         "page": page,
         "limit": limit,
+        "sort_by": sort_by,
+        "sort_order": sort_order,
         "total": total_matching,
         "summary_counts": summary_counts,
         "items": paginated_items
@@ -549,12 +574,16 @@ async def export_compact_batch(
     limit: Optional[int] = None,
     download: bool = True,
     ids: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_order: Optional[str] = "desc",
+    simplified: bool = False,
     payload: Optional[Dict[str, Any]] = Body(None)
 ):
     """
     Export function for batch queue that deduplicates static prompt data into common_metadata,
     truncates user prompt snippets to 500 chars, and supports tier, status, item ID selection,
-    limit filtering and direct file download. Supports both GET and POST requests.
+    sorting (sort_by, sort_order), limit filtering and direct file download. Supports both GET and POST requests.
+    If simplified=True, returns ONLY title and user_prompt_snippet for each finding.
     """
     target_ids_set = None
     if payload and isinstance(payload, dict):
@@ -563,10 +592,16 @@ async def export_compact_batch(
         tier = payload.get("tier", tier)
         status_filter = payload.get("status_filter", status_filter)
         limit = payload.get("limit", limit)
+        sort_by = payload.get("sort_by", sort_by)
+        sort_order = payload.get("sort_order", sort_order)
+        if "simplified" in payload:
+            simplified = payload["simplified"]
         if "download" in payload:
             download = payload["download"]
     if target_ids_set is None and ids:
         target_ids_set = set(i.strip() for i in ids.split(",") if i.strip())
+
+    is_simplified = str(simplified).lower() in ["true", "1", "yes"]
 
     prompt_cfg = {}
     if CONFIG_FILE.exists():
@@ -666,6 +701,7 @@ async def export_compact_batch(
             item_export: Dict[str, Any] = {
                 "id": fid,
                 "finding_id": fid,
+                "title": title,
                 "source_pool": raw_item.get("source_pool", "unknown"),
                 "protocol_name": raw_item.get("protocol_name") or raw_item.get("source_repo") or "unknown",
                 "total_tokens": raw_item.get("total_tokens", 0),
@@ -680,25 +716,79 @@ async def export_compact_batch(
 
             requests.append(item_export)
 
+    if sort_by:
+        sb = sort_by.lower()
+        reverse = (sort_order.lower() == "desc") if sort_order else True
+        if sb in ["tokens", "total_tokens", "user_prompt_tokens"]:
+            requests.sort(key=lambda x: x.get("total_tokens", 0), reverse=reverse)
+        elif sb in ["id", "finding_id"]:
+            requests.sort(key=lambda x: str(x.get("id") or "").lower(), reverse=reverse)
+        elif sb == "title":
+            requests.sort(key=lambda x: str(x.get("title") or "").lower(), reverse=reverse)
+        elif sb in ["protocol", "protocol_name"]:
+            requests.sort(key=lambda x: str(x.get("protocol_name") or "").lower(), reverse=reverse)
+        elif sb in ["source_pool", "pool"]:
+            requests.sort(key=lambda x: str(x.get("source_pool") or "").lower(), reverse=reverse)
+        elif sb in ["status", "enrichment_status"]:
+            requests.sort(key=lambda x: str(x.get("enrichment_status") or "").lower(), reverse=reverse)
+
     if limit is not None and limit > 0:
         requests = requests[:limit]
 
-    export_payload = {
-        "common_metadata": common_metadata,
-        "requests": requests
-    }
+    if is_simplified:
+        export_payload = [
+            {
+                "title": item.get("title", ""),
+                "user_prompt_snippet": item.get("user_prompt_snippet", "")
+            }
+            for item in requests
+        ]
+    else:
+        export_payload = {
+            "common_metadata": common_metadata,
+            "requests": requests
+        }
 
     if download:
         content_json = json.dumps(export_payload, indent=2)
+        filename = "simplified_queue_export.json" if is_simplified else "preprocessed_queue_export.json"
         return Response(
             content=content_json,
             media_type="application/json",
             headers={
-                "Content-Disposition": 'attachment; filename="preprocessed_queue_export.json"'
+                "Content-Disposition": f'attachment; filename="{filename}"'
             }
         )
 
     return export_payload
+
+@app.api_route("/api/batch/export-simplified", methods=["GET", "POST"])
+async def export_simplified_batch(
+    request: Request = None,
+    tier: Optional[str] = None,
+    status_filter: Optional[str] = "ALL",
+    limit: Optional[int] = None,
+    download: bool = True,
+    ids: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_order: Optional[str] = "desc",
+    payload: Optional[Dict[str, Any]] = Body(None)
+):
+    """
+    Dedicated endpoint to export ONLY title and user_prompt_snippet for each queued item.
+    """
+    return await export_compact_batch(
+        request=request,
+        tier=tier,
+        status_filter=status_filter,
+        limit=limit,
+        download=download,
+        ids=ids,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        simplified=True,
+        payload=payload
+    )
 
 @app.api_route("/api/batch/control", methods=["GET", "POST"])
 def batch_control(payload: Optional[Dict[str, Any]] = Body(None), action: Optional[str] = None):
