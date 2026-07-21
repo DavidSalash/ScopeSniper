@@ -461,6 +461,7 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
   const [searchQuery, setSearchQuery] = useState("")
   const [debouncedSearch, setDebouncedSearch] = useState("")
   const [loading, setLoading] = useState(true)
+  const [selectedItemIds, setSelectedItemIds] = useState<string[]>([])
 
   // Control State
   const [batchStatus, setBatchStatus] = useState<"RUNNING" | "STOPPED">("STOPPED")
@@ -478,6 +479,27 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
   const [itemDetails, setItemDetails] = useState<any | null>(null)
   const [loadingItem, setLoadingItem] = useState(false)
   const pollingRef = useRef<NodeJS.Timeout | null>(null)
+
+  const handleToggleSelectItem = (id: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation()
+    setSelectedItemIds(prev =>
+      prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]
+    )
+  }
+
+  const handleToggleSelectAllPage = () => {
+    const pageIds = items.map(i => i.id)
+    const allPageSelected = pageIds.length > 0 && pageIds.every(id => selectedItemIds.includes(id))
+    if (allPageSelected) {
+      setSelectedItemIds(prev => prev.filter(id => !pageIds.includes(id)))
+    } else {
+      setSelectedItemIds(prev => Array.from(new Set([...prev, ...pageIds])))
+    }
+  }
+
+  const handleClearSelection = () => {
+    setSelectedItemIds([])
+  }
 
   const fetchRuntimeConfig = useCallback(async () => {
     try {
@@ -653,6 +675,50 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
     }
   }
 
+  const handleExportCompactJson = async () => {
+    if (selectedItemIds.length > 0) {
+      addConsoleLog(`Initiating compact batch JSON export for ${selectedItemIds.length} selected items...`, "info")
+      try {
+        const res = await fetch(`${API_URL}/batch/export`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ids: selectedItemIds, download: false })
+        })
+        if (res.ok) {
+          const data = await res.json()
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })
+          const url = URL.createObjectURL(blob)
+          const a = document.createElement("a")
+          a.href = url
+          a.download = "preprocessed_queue_export.json"
+          document.body.appendChild(a)
+          a.click()
+          document.body.removeChild(a)
+          URL.revokeObjectURL(url)
+          addConsoleLog(`Successfully exported ${selectedItemIds.length} selected items to preprocessed_queue_export.json`, "info")
+        } else {
+          const errText = await res.text()
+          addConsoleLog(`Failed to export selected items: ${errText}`, "error")
+        }
+      } catch (e) {
+        addConsoleLog(`Exception during compact export: ${e}`, "error")
+      }
+    } else {
+      const params = new URLSearchParams()
+      if (selectedTier) params.append("tier", selectedTier)
+      params.append("download", "true")
+      const exportUrl = `${API_URL}/batch/export?${params.toString()}`
+
+      addConsoleLog(`Initiating compact batch JSON export download: ${exportUrl}`, "info")
+      const a = document.createElement("a")
+      a.href = exportUrl
+      a.download = "preprocessed_queue_export.json"
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+    }
+  }
+
   const totalPages = Math.ceil(totalMatching / limit) || 1
 
   return (
@@ -759,6 +825,27 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
             <RefreshCw className="w-3.5 h-3.5 mr-1.5 text-sky-400" />
             Refresh Queue
           </Button>
+
+          {selectedItemIds.length > 0 && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="border-slate-800 hover:bg-slate-900 bg-slate-950 text-rose-400 hover:text-rose-300 h-9 font-mono text-xs"
+              onClick={handleClearSelection}
+            >
+              Clear ({selectedItemIds.length})
+            </Button>
+          )}
+
+          <Button
+            variant="outline"
+            size="sm"
+            className="border-slate-800 hover:bg-slate-900 bg-slate-950 text-slate-300 h-9 font-mono"
+            onClick={handleExportCompactJson}
+          >
+            <Download className="w-3.5 h-3.5 mr-1.5 text-emerald-400" />
+            {selectedItemIds.length > 0 ? `Export Selected (${selectedItemIds.length})` : "Export Compact JSON"}
+          </Button>
         </div>
       </div>
 
@@ -818,6 +905,11 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
               <Badge className="bg-sky-500/10 text-sky-400 border border-sky-500/20 font-mono text-[10px]">
                 {totalMatching.toLocaleString()} Items Filtered
               </Badge>
+              {selectedItemIds.length > 0 && (
+                <Badge className="bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono text-[10px]">
+                  {selectedItemIds.length} Selected
+                </Badge>
+              )}
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
@@ -869,6 +961,14 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
           <Table className="border-collapse">
             <TableHeader className="bg-slate-900/40 border-b border-slate-900 font-mono text-[11px] text-slate-400 uppercase tracking-wider">
               <TableRow>
+                <TableHead className="w-10 text-center text-slate-400">
+                  <input
+                    type="checkbox"
+                    className="rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-400 h-3.5 w-3.5 cursor-pointer"
+                    checked={items.length > 0 && items.every(i => selectedItemIds.includes(i.id))}
+                    onChange={handleToggleSelectAllPage}
+                  />
+                </TableHead>
                 <TableHead className="w-12 text-slate-400">#</TableHead>
                 <TableHead className="w-64 text-slate-400">Finding ID</TableHead>
                 <TableHead className="w-32 text-slate-400">Source Pool</TableHead>
@@ -881,14 +981,14 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
             <TableBody className="text-xs divide-y divide-slate-900/60 font-mono">
               {loading ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="text-center py-12 text-slate-500">
+                  <TableCell colSpan={8} className="text-center py-12 text-slate-500">
                     <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-sky-400" />
                     Fetching pre-processed findings...
                   </TableCell>
                 </TableRow>
               ) : items.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="text-center py-12 text-slate-500">
+                  <TableCell colSpan={8} className="text-center py-12 text-slate-500">
                     No pre-processed queue items match your filter criteria.
                   </TableCell>
                 </TableRow>
@@ -896,9 +996,19 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
                 items.map((row, idx) => (
                   <TableRow
                     key={`${row.id}-${idx}`}
-                    className="cursor-pointer hover:bg-slate-900/80 transition-colors border-b border-slate-900/40 select-none"
+                    className={`cursor-pointer transition-colors border-b border-slate-900/40 select-none ${
+                      selectedItemIds.includes(row.id) ? "bg-sky-950/30 hover:bg-sky-950/40" : "hover:bg-slate-900/80"
+                    }`}
                     onClick={() => handleOpenItemDrawer(row.id)}
                   >
+                    <TableCell className="text-center" onClick={(e) => e.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        className="rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-400 h-3.5 w-3.5 cursor-pointer"
+                        checked={selectedItemIds.includes(row.id)}
+                        onChange={() => handleToggleSelectItem(row.id)}
+                      />
+                    </TableCell>
                     <TableCell className="text-slate-500 font-bold">{(page - 1) * limit + idx + 1}</TableCell>
                     <TableCell>
                       <div className="font-bold text-white text-xs truncate max-w-[240px]" title={row.id}>

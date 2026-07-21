@@ -171,51 +171,46 @@ def process_single_finding_enrichment(
                 raw_vllm_response = None
                 extracted_data = None
 
-    # Schema & taxonomy path validation and fallback filling
+    # Strict validation of raw vLLM output (NO defaults or mock fallbacks)
     if not isinstance(extracted_data, dict):
-        extracted_data = {
-            "thinking_process": f"Evaluated finding '{title}' for structural vulnerability classification.",
-            "taxonomy_slug": default_path.split("/")[-1],
-            "taxonomy_path": default_path,
-            "confidence_score": 0.85,
-            "vulnerability_summary": f"Identified security issue in {title}",
-            "root_cause_explanation": f"Contract flaw reported in {title}",
-            "attack_vector_steps": ["Analyze contract logic", "Identify state inconsistency"],
-            "preconditions": ["Target contract deployed on network"],
-            "impact_scope": "direct_theft_of_user_funds",
-            "affected_solidity_constructs": ["external_call"],
-            "remediation_pattern": "Implement validation checks and follow best security practices"
-        }
+        validation_status = "FAIL"
+        validation_errors.append("Model failed to output valid JSON object")
+    else:
+        # Validate required keys and check for hardcoded/generic placeholder text
+        required_keys = ["vulnerability_summary", "attack_vector_steps", "root_cause_explanation"]
+        placeholder_strings = [
+            "Analyze contract logic",
+            "Identified security issue in",
+            "Contract flaw reported in",
+            "Identify state inconsistency"
+        ]
 
-    # Fill default values for missing or empty keys
-    defaults = {
-        "thinking_process": f"Evaluated finding '{title}' for structural vulnerability classification.",
-        "taxonomy_slug": default_path.split("/")[-1],
-        "taxonomy_path": default_path,
-        "confidence_score": 0.85,
-        "vulnerability_summary": f"Identified security issue in {title}",
-        "root_cause_explanation": f"Contract flaw reported in {title}",
-        "attack_vector_steps": ["Analyze contract logic", "Identify state inconsistency"],
-        "preconditions": ["Target contract deployed on network"],
-        "impact_scope": "direct_theft_of_user_funds",
-        "affected_solidity_constructs": ["external_call"],
-        "remediation_pattern": "Implement validation checks and follow best security practices"
-    }
+        for req_key in required_keys:
+            val = extracted_data.get(req_key)
+            if val is None:
+                validation_errors.append(f"Missing required key: '{req_key}'")
+            elif isinstance(val, str):
+                if not val.strip():
+                    validation_errors.append(f"Empty value for required key: '{req_key}'")
+                elif any(p_str in val for p_str in placeholder_strings):
+                    validation_errors.append(f"Generic placeholder text found in required key: '{req_key}'")
+            elif isinstance(val, list):
+                if len(val) == 0:
+                    validation_errors.append(f"Empty list for required key: '{req_key}'")
+                else:
+                    for idx, item in enumerate(val):
+                        if not isinstance(item, str) or not item.strip():
+                            validation_errors.append(f"Item {idx} in '{req_key}' is empty or not a string")
+                        elif any(p_str in str(item) for p_str in placeholder_strings):
+                            validation_errors.append(f"Generic placeholder text found in '{req_key}' item {idx}")
+            else:
+                validation_errors.append(f"Invalid type for required key: '{req_key}'")
 
-    for k, def_val in defaults.items():
-        if k not in extracted_data or extracted_data[k] is None:
-            extracted_data[k] = def_val
-        elif isinstance(def_val, str) and isinstance(extracted_data[k], str) and not extracted_data[k].strip():
-            extracted_data[k] = def_val
-        elif isinstance(def_val, list) and (not isinstance(extracted_data[k], list) or len(extracted_data[k]) == 0):
-            extracted_data[k] = def_val
-
-    # Normalize taxonomy_path against valid active taxonomy set
-    tax_path = extracted_data.get("taxonomy_path")
-    valid_set = set(valid_paths)
-    if valid_paths and tax_path not in valid_set:
-        normalized = None
-        if tax_path:
+        # Normalize taxonomy_path against valid active taxonomy set if taxonomy_path is present
+        tax_path = extracted_data.get("taxonomy_path")
+        valid_set = set(valid_paths)
+        if valid_paths and tax_path and tax_path not in valid_set:
+            normalized = None
             alt1 = tax_path.replace("smart_contract/", "defi_protocol/")
             alt2 = tax_path.replace("defi_protocol/", "smart_contract/")
             if alt1 in valid_set:
@@ -227,18 +222,13 @@ def process_single_finding_enrichment(
                     if vp.endswith(tax_path) or tax_path.endswith(vp) or vp.split("/")[-1] == tax_path.split("/")[-1]:
                         normalized = vp
                         break
-        if normalized:
-            extracted_data["taxonomy_path"] = normalized
+            if normalized:
+                extracted_data["taxonomy_path"] = normalized
+
+        if not validation_errors:
+            validation_status = "PASS"
         else:
-            extracted_data["taxonomy_path"] = default_path
-
-    validation_status = "PASS"
-    validation_errors = []
-
-    if not validation_errors:
-        validation_status = "PASS"
-    else:
-        validation_status = "FAIL"
+            validation_status = "FAIL"
 
     protocol_name = finding.get("protocol_name") or finding.get("source_repo") or "unknown"
 

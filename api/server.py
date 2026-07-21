@@ -9,12 +9,13 @@ from pathlib import Path
 WORKSPACE_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(WORKSPACE_DIR))
 
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, BackgroundTasks, Request, Body, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from core.database import get_unified_connection, init_unified_db, DB_LOCK
+from core.database import get_unified_connection, init_unified_db, attach_vulnerabilities_db, DB_LOCK
 from core.math_engine import get_target_profitability_matrix
 from core.pipeline import (
     TOKEN_BUCKET_TIERS,
@@ -25,6 +26,7 @@ from core.pipeline import (
     REFUSAL_GUARD_TEXT
 )
 from core.batch_enricher import _get_active_taxonomy_guide
+from core.preprocessor import get_static_system_prompt
 from core.ingest_source_dbs import run_full_source_ingestion
 from core.tracker import run_state_differential_tracker_loop
 
@@ -388,7 +390,6 @@ async def event_stream(request: Request):
             completed_enrichment_cnt = 0
             total_normalized_cnt = 0
             try:
-                from core.database import attach_vulnerabilities_db
                 attach_vulnerabilities_db(conn)
                 cursor.execute("SELECT COUNT(*) as completed FROM vuln.enriched_findings_metadata")
                 res = cursor.fetchone()
@@ -480,7 +481,6 @@ def get_batch_queue(
     completed_ids = set()
     try:
         conn = get_unified_connection()
-        from core.database import attach_vulnerabilities_db
         attach_vulnerabilities_db(conn)
         cursor = conn.cursor()
         cursor.execute("SELECT finding_id FROM vuln.enriched_findings_metadata")
@@ -540,6 +540,165 @@ def get_batch_queue(
         "summary_counts": summary_counts,
         "items": paginated_items
     }
+
+@app.api_route("/api/batch/export", methods=["GET", "POST"])
+async def export_compact_batch(
+    request: Request = None,
+    tier: Optional[str] = None,
+    status_filter: Optional[str] = "ALL",
+    limit: Optional[int] = None,
+    download: bool = True,
+    ids: Optional[str] = None,
+    payload: Optional[Dict[str, Any]] = Body(None)
+):
+    """
+    Export function for batch queue that deduplicates static prompt data into common_metadata,
+    truncates user prompt snippets to 500 chars, and supports tier, status, item ID selection,
+    limit filtering and direct file download. Supports both GET and POST requests.
+    """
+    target_ids_set = None
+    if payload and isinstance(payload, dict):
+        if "ids" in payload and isinstance(payload["ids"], list):
+            target_ids_set = set(str(i) for i in payload["ids"])
+        tier = payload.get("tier", tier)
+        status_filter = payload.get("status_filter", status_filter)
+        limit = payload.get("limit", limit)
+        if "download" in payload:
+            download = payload["download"]
+    if target_ids_set is None and ids:
+        target_ids_set = set(i.strip() for i in ids.split(",") if i.strip())
+
+    prompt_cfg = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                prompt_cfg = json.load(f)
+        except Exception:
+            pass
+
+    conn = get_unified_connection()
+    attach_vulnerabilities_db(conn)
+    try:
+        taxonomy_guide = _get_active_taxonomy_guide(conn)
+    except Exception:
+        taxonomy_guide = []
+
+    system_prompt = get_static_system_prompt(taxonomy_guide)
+
+    common_metadata = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "model_name": prompt_cfg.get("model_name", "Kbenkhaled/Qwen3.5-9B-NVFP4"),
+        "max_tokens": prompt_cfg.get("max_tokens", 4096),
+        "temperature": prompt_cfg.get("temperature", 0.0),
+        "vllm_endpoint": prompt_cfg.get("vllm_endpoint", "http://192.168.1.57:8000/v1/chat/completions"),
+        "system_prompt": system_prompt
+    }
+
+    enriched_data_map = {}
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT finding_id, taxonomy_path, vulnerability_summary, root_cause_explanation,
+                   attack_vector_steps_json, preconditions_json, impact_scope,
+                   affected_constructs_json, remediation_pattern, processed_at
+            FROM vuln.enriched_findings_metadata
+        """)
+        def safe_parse_json(val):
+            if not val:
+                return []
+            try:
+                return json.loads(val)
+            except Exception:
+                return [val]
+
+        for row in cursor.fetchall():
+            row_dict = dict(row)
+            fid = row_dict["finding_id"]
+            enriched_data_map[fid] = {
+                "taxonomy_path": row_dict.get("taxonomy_path"),
+                "vulnerability_summary": row_dict.get("vulnerability_summary"),
+                "root_cause_explanation": row_dict.get("root_cause_explanation"),
+                "attack_vector_steps": safe_parse_json(row_dict.get("attack_vector_steps_json")),
+                "preconditions": safe_parse_json(row_dict.get("preconditions_json")),
+                "impact_scope": row_dict.get("impact_scope"),
+                "affected_solidity_constructs": safe_parse_json(row_dict.get("affected_constructs_json")),
+                "remediation_pattern": row_dict.get("remediation_pattern"),
+                "processed_at": row_dict.get("processed_at")
+            }
+    except Exception as e:
+        print(f"[-] Error fetching enriched metadata map: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    queue_data = load_queue_distribution()
+    buckets = queue_data.get("buckets", {})
+    tier_keys = ["less_than_1k", "1k_to_2k", "2k_to_4k", "greater_than_4k"]
+
+    if tier and tier in buckets:
+        selected_tiers = [tier]
+    else:
+        selected_tiers = [t for t in tier_keys if t in buckets]
+
+    requests: List[Dict[str, Any]] = []
+
+    for t_key in selected_tiers:
+        for raw_item in buckets.get(t_key, []):
+            fid = raw_item.get("id")
+            if target_ids_set is not None and fid not in target_ids_set:
+                continue
+
+            is_completed = fid in enriched_data_map
+            enrichment_status = "COMPLETED" if is_completed else "PENDING"
+
+            if status_filter and status_filter.upper() != "ALL":
+                if enrichment_status.upper() != status_filter.upper():
+                    continue
+
+            title = raw_item.get("title", "")
+            severity = raw_item.get("severity", "")
+            content = raw_item.get("content_snippet", "") or raw_item.get("content_markdown", "")
+            raw_user_prompt = raw_item.get("user_prompt") or f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content}"
+            truncated_prompt = raw_user_prompt[:500]
+
+            item_export: Dict[str, Any] = {
+                "id": fid,
+                "finding_id": fid,
+                "source_pool": raw_item.get("source_pool", "unknown"),
+                "protocol_name": raw_item.get("protocol_name") or raw_item.get("source_repo") or "unknown",
+                "total_tokens": raw_item.get("total_tokens", 0),
+                "context_tier": t_key,
+                "enrichment_status": enrichment_status,
+                "user_prompt": truncated_prompt,
+                "user_prompt_snippet": truncated_prompt
+            }
+
+            if enrichment_status == "COMPLETED":
+                item_export["enriched_output"] = enriched_data_map[fid]
+
+            requests.append(item_export)
+
+    if limit is not None and limit > 0:
+        requests = requests[:limit]
+
+    export_payload = {
+        "common_metadata": common_metadata,
+        "requests": requests
+    }
+
+    if download:
+        content_json = json.dumps(export_payload, indent=2)
+        return Response(
+            content=content_json,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": 'attachment; filename="preprocessed_queue_export.json"'
+            }
+        )
+
+    return export_payload
 
 @app.api_route("/api/batch/control", methods=["GET", "POST"])
 def batch_control(payload: Optional[Dict[str, Any]] = Body(None), action: Optional[str] = None):
@@ -620,9 +779,8 @@ def get_batch_item(finding_id: str):
     and completed output for a given finding_id.
     """
     conn = get_unified_connection()
+    attach_vulnerabilities_db(conn)
     try:
-        from core.database import attach_vulnerabilities_db
-        attach_vulnerabilities_db(conn)
         cursor = conn.cursor()
 
         cursor.execute("""
