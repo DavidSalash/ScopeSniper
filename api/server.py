@@ -635,7 +635,8 @@ async def export_compact_batch(
         cursor.execute("""
             SELECT finding_id, taxonomy_path, vulnerability_summary, root_cause_explanation,
                    attack_vector_steps_json, preconditions_json, impact_scope,
-                   affected_constructs_json, remediation_pattern, processed_at
+                   affected_constructs_json, remediation_pattern,
+                   training_suitability_score, training_suitability_reason, processed_at
             FROM vuln.enriched_findings_metadata
         """)
         def safe_parse_json(val):
@@ -658,6 +659,8 @@ async def export_compact_batch(
                 "impact_scope": row_dict.get("impact_scope"),
                 "affected_solidity_constructs": safe_parse_json(row_dict.get("affected_constructs_json")),
                 "remediation_pattern": row_dict.get("remediation_pattern"),
+                "training_suitability_score": row_dict.get("training_suitability_score"),
+                "training_suitability_reason": row_dict.get("training_suitability_reason"),
                 "processed_at": row_dict.get("processed_at")
             }
     except Exception as e:
@@ -891,7 +894,8 @@ def get_batch_item(finding_id: str):
         cursor.execute("""
             SELECT taxonomy_path, vulnerability_summary, root_cause_explanation,
                    attack_vector_steps_json, preconditions_json, impact_scope,
-                   affected_constructs_json, remediation_pattern, processed_at
+                   affected_constructs_json, remediation_pattern,
+                   training_suitability_score, training_suitability_reason, processed_at
             FROM vuln.enriched_findings_metadata
             WHERE finding_id = ?
         """, (finding_id,))
@@ -919,6 +923,8 @@ def get_batch_item(finding_id: str):
                 "impact_scope": e_dict.get("impact_scope"),
                 "affected_solidity_constructs": safe_parse_json(e_dict.get("affected_constructs_json")),
                 "remediation_pattern": e_dict.get("remediation_pattern"),
+                "training_suitability_score": e_dict.get("training_suitability_score"),
+                "training_suitability_reason": e_dict.get("training_suitability_reason"),
                 "thinking_process": f"Evaluated audit report for {finding.get('protocol_name', 'target protocol')} with {severity} severity impact.",
                 "processed_at": e_dict.get("processed_at")
             }
@@ -937,31 +943,7 @@ def get_batch_item(finding_id: str):
             except Exception:
                 pass
 
-        default_path = taxonomy_guide[0]["path"] if taxonomy_guide else "smart_contract/reentrancy/read_only/view_desync"
-
-        system_prompt = (
-            "You are an expert smart contract security auditor and AI trainer. "
-            "Classify the input finding into our vulnerability taxonomy and extract rich structured metadata.\n"
-            f"Valid active taxonomy guide: {json.dumps(taxonomy_guide)}\n"
-            "IMPORTANT CONSTRAINTS:\n"
-            "1. You MUST select a 'taxonomy_path' strictly present in the valid active taxonomy guide above.\n"
-            "2. Keep 'thinking_process' concise (1-2 sentences) so output fits within token budget.\n"
-            "3. The array fields ('attack_vector_steps', 'preconditions', 'affected_solidity_constructs') MUST ALWAYS be non-empty lists with at least 1 string element.\n\n"
-            "Output ONLY a valid JSON object strictly matching this payload schema:\n"
-            "{\n"
-            '  "thinking_process": "<brief 1-2 sentence step-by-step reasoning about the finding>",\n'
-            '  "taxonomy_slug": "view_desync",\n'
-            f'  "taxonomy_path": "{default_path}",\n'
-            '  "confidence_score": 0.95,\n'
-            '  "vulnerability_summary": "<summary>",\n'
-            '  "root_cause_explanation": "<root cause>",\n'
-            '  "attack_vector_steps": ["step 1", "step 2"],\n'
-            '  "preconditions": ["precondition 1"],\n'
-            '  "impact_scope": "direct_theft_of_user_funds",\n'
-            '  "affected_solidity_constructs": ["view_function", "external_call"],\n'
-            '  "remediation_pattern": "<remediation>"\n'
-            "}"
-        )
+        system_prompt = get_static_system_prompt(taxonomy_guide)
 
         user_prompt = f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content_markdown}"
 

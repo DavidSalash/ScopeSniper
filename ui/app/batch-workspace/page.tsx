@@ -1238,13 +1238,29 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
                 <Maximize2 className="w-4 h-4 text-sky-400" />
                 Inspection Drawer: {activeFindingId}
               </SheetTitle>
-              {itemDetails && (
-                <Badge className={itemDetails.enrichment_status === "COMPLETED"
-                  ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-mono text-[10px]"
-                  : "bg-amber-500/20 text-amber-400 border border-amber-500/30 animate-pulse font-mono text-[10px]"}>
-                  {itemDetails.enrichment_status}
-                </Badge>
-              )}
+              <div className="flex items-center gap-2">
+                {itemDetails?.enriched_output?.training_suitability_score !== undefined && itemDetails?.enriched_output?.training_suitability_score !== null && (
+                  <Badge className={
+                    itemDetails.enriched_output.training_suitability_score >= 0.7
+                      ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono text-[10px] font-bold"
+                      : itemDetails.enriched_output.training_suitability_score >= 0.4
+                      ? "bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono text-[10px] font-bold"
+                      : "bg-rose-500/20 text-rose-300 border border-rose-500/40 font-mono text-[10px] font-bold"
+                  }>
+                    Score: {Number(itemDetails.enriched_output.training_suitability_score).toFixed(2)}/1.0 - {
+                      itemDetails.enriched_output.training_suitability_score >= 0.7 ? "High Training Value" :
+                      itemDetails.enriched_output.training_suitability_score >= 0.4 ? "Moderate Training Value" : "Low Training Value"
+                    }
+                  </Badge>
+                )}
+                {itemDetails && (
+                  <Badge className={itemDetails.enrichment_status === "COMPLETED"
+                    ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-mono text-[10px]"
+                    : "bg-amber-500/20 text-amber-400 border border-amber-500/30 animate-pulse font-mono text-[10px]"}>
+                    {itemDetails.enrichment_status}
+                  </Badge>
+                )}
+              </div>
             </div>
             <SheetDescription className="text-xs font-mono text-slate-400">
               Payload inspection, prompt telemetry, and live enrichment results.
@@ -1316,6 +1332,25 @@ function PreProcessedQueueInspectorView({ addConsoleLog }: { addConsoleLog: (msg
                         </span>
                         <p className="text-xs text-amber-200 leading-relaxed font-sans">
                           {itemDetails.enriched_output.thinking_process}
+                        </p>
+                      </div>
+                    )}
+
+                    {itemDetails.enriched_output.training_suitability_reason && (
+                      <div className="bg-sky-950/30 border border-sky-800/50 p-4 rounded-lg flex flex-col gap-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] text-sky-400 font-bold uppercase tracking-wider flex items-center gap-1.5 font-mono">
+                            <Activity className="w-3.5 h-3.5 text-sky-400" />
+                            AI Training Suitability Assessment
+                          </span>
+                          {itemDetails.enriched_output.training_suitability_score !== undefined && itemDetails.enriched_output.training_suitability_score !== null && (
+                            <span className="font-mono text-xs font-bold text-sky-300">
+                              Rating: {Number(itemDetails.enriched_output.training_suitability_score).toFixed(2)} / 1.0
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-slate-200 leading-relaxed font-sans mt-1">
+                          {itemDetails.enriched_output.training_suitability_reason}
                         </p>
                       </div>
                     )}

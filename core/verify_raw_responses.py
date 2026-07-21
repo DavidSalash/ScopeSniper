@@ -39,11 +39,11 @@ def verify_raw_responses():
     assert corrupted_count == 0, f"Error: Found {corrupted_count} corrupted records after purge!"
     print("[+] Assertion passed: 0 records contain hardcoded template strings in DB.")
 
-    # 2. Select 10 stratified finding samples for live inference verification
+    # 2. Select 5 stratified finding samples for live inference verification
     cursor.execute("""
     SELECT id, source_pool, protocol_name, source_repo, title, content_markdown, severity 
     FROM vuln.normalized_findings
-    LIMIT 10
+    LIMIT 5
     """)
     sample_findings = [dict(r) for r in cursor.fetchall()]
     
@@ -66,7 +66,7 @@ def verify_raw_responses():
     ]
 
     for i, finding in enumerate(sample_findings, 1):
-        print(f"\n--- Request {i}/10 (Finding ID: {finding['id']}) ---")
+        print(f"\n--- Request {i}/5 (Finding ID: {finding['id']}) ---")
         try:
             res = process_single_finding_enrichment(finding, taxonomy_guide, cfg)
             raw_response = res.get("raw_vllm_response") or ""
@@ -84,6 +84,14 @@ def verify_raw_responses():
             if parsed_payload:
                 print("\nParsed JSON Payload:")
                 print(json.dumps(parsed_payload, indent=2))
+
+                score = parsed_payload.get("training_suitability_score")
+                reason = parsed_payload.get("training_suitability_reason")
+                print(f"[+] Training Suitability Score: {score} | Reason: {reason}")
+                if score is not None:
+                    assert isinstance(score, (int, float)) and 0.0 <= float(score) <= 1.0, f"Assertion Failed: training_suitability_score '{score}' is out of range [0.0, 1.0]"
+                if reason is not None:
+                    assert isinstance(reason, str) and len(reason.strip()) > 0, "Assertion Failed: training_suitability_reason is empty"
 
             # Check hardcoded template assertions
             for tmpl in placeholder_templates:

@@ -79,6 +79,8 @@ def init_vulnerabilities_db():
             impact_scope TEXT,
             affected_constructs_json TEXT,
             remediation_pattern TEXT,
+            training_suitability_score REAL,
+            training_suitability_reason TEXT,
             processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(finding_id) REFERENCES normalized_findings(id) ON DELETE CASCADE,
             FOREIGN KEY(taxonomy_path) REFERENCES vulnerability_taxonomy(path)
@@ -86,6 +88,16 @@ def init_vulnerabilities_db():
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_enrich_path ON enriched_findings_metadata(taxonomy_path);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_enrich_impact ON enriched_findings_metadata(impact_scope);")
+
+        # Dynamic migrations for missing columns in pre-existing DB schemas
+        try:
+            cursor.execute("ALTER TABLE enriched_findings_metadata ADD COLUMN training_suitability_score REAL;")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE enriched_findings_metadata ADD COLUMN training_suitability_reason TEXT;")
+        except sqlite3.OperationalError:
+            pass
     conn.close()
 
 def attach_vulnerabilities_db(conn: sqlite3.Connection) -> None:

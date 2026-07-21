@@ -75,29 +75,8 @@ def process_single_finding_enrichment(
     if valid_paths and default_path not in valid_paths:
         default_path = valid_paths[0]
 
-    system_prompt = (
-        "You are an expert smart contract security auditor and AI trainer. "
-        "Classify the input finding into our vulnerability taxonomy and extract rich structured metadata.\n"
-        f"Valid active taxonomy guide: {json.dumps(taxonomy_guide)}\n"
-        "IMPORTANT CONSTRAINTS:\n"
-        "1. You MUST select a 'taxonomy_path' strictly present in the valid active taxonomy guide above.\n"
-        "2. Keep 'thinking_process' concise (1-2 sentences) so output fits within token budget.\n"
-        "3. The array fields ('attack_vector_steps', 'preconditions', 'affected_solidity_constructs') MUST ALWAYS be non-empty lists with at least 1 string element.\n\n"
-        "Output ONLY a valid JSON object strictly matching this payload schema:\n"
-        "{\n"
-        '  "thinking_process": "<brief 1-2 sentence step-by-step reasoning about the finding>",\n'
-        '  "taxonomy_slug": "view_desync",\n'
-        f'  "taxonomy_path": "{default_path}",\n'
-        '  "confidence_score": 0.95,\n'
-        '  "vulnerability_summary": "<summary>",\n'
-        '  "root_cause_explanation": "<root cause>",\n'
-        '  "attack_vector_steps": ["step 1", "step 2"],\n'
-        '  "preconditions": ["precondition 1"],\n'
-        '  "impact_scope": "direct_theft_of_user_funds",\n'
-        '  "affected_solidity_constructs": ["view_function", "external_call"],\n'
-        '  "remediation_pattern": "<remediation>"\n'
-        "}"
-    )
+    from core.preprocessor import get_static_system_prompt
+    system_prompt = get_static_system_prompt(taxonomy_guide)
 
     user_prompt = f"Finding Title: {title}\nSeverity: {severity}\n\nContent:\n{content}"
     raw_input_prompt = f"System:\n{system_prompt}\n\nUser:\n{user_prompt}"
@@ -298,6 +277,11 @@ async def run_enrichment_batch(sample_limit: Optional[int] = None) -> Dict[str, 
         affected_constructs_json = json.dumps(data.get("affected_solidity_constructs", []))
         remediation = data.get("remediation_pattern", "")
         slug = data.get("taxonomy_slug", tax_path.split("/")[-1])
+        try:
+            suitability_score = float(data.get("training_suitability_score", 1.0))
+        except (ValueError, TypeError):
+            suitability_score = 1.0
+        suitability_reason = str(data.get("training_suitability_reason") or "")
 
         cursor = conn.cursor()
         with DB_LOCK:
@@ -306,12 +290,14 @@ async def run_enrichment_batch(sample_limit: Optional[int] = None) -> Dict[str, 
                 INSERT OR REPLACE INTO vuln.enriched_findings_metadata (
                     finding_id, taxonomy_path, vulnerability_summary, root_cause_explanation,
                     attack_vector_steps_json, preconditions_json, impact_scope,
-                    affected_constructs_json, remediation_pattern
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    affected_constructs_json, remediation_pattern,
+                    training_suitability_score, training_suitability_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     finding_id, tax_path, summary, root_cause,
                     attack_steps_json, preconditions_json, impact_scope,
-                    affected_constructs_json, remediation
+                    affected_constructs_json, remediation,
+                    suitability_score, suitability_reason
                 ))
 
                 cursor.execute("""

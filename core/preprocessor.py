@@ -54,6 +54,8 @@ def get_static_system_prompt(taxonomy_guide: List[Dict[str, str]]) -> str:
     return (
         "You are an expert smart contract security auditor and AI trainer. "
         "Classify the input finding into our vulnerability taxonomy and extract rich structured metadata.\n"
+        "Grade 'training_suitability_score' from 0.0 to 1.0 based on how well this report can train an AI vulnerability detection pipeline. "
+        "Penalize reports that lack code, test strings ('THIS IS A TEST'), non-security noise ('missing NatSpec', 'no license'), or naked GitHub links without explanations.\n"
         f"Valid active taxonomy guide: {json.dumps(taxonomy_guide)}\n"
         "IMPORTANT CONSTRAINTS:\n"
         "1. You MUST select a 'taxonomy_path' strictly present in the valid active taxonomy guide above.\n"
@@ -62,6 +64,8 @@ def get_static_system_prompt(taxonomy_guide: List[Dict[str, str]]) -> str:
         "Output ONLY a valid JSON object strictly matching this payload schema:\n"
         "{\n"
         '  "thinking_process": "<brief 1-2 sentence step-by-step reasoning about the finding>",\n'
+        '  "training_suitability_score": 0.85,\n'
+        '  "training_suitability_reason": "<1 sentence explanation of why this report is suitable or unsuitable for training an AI vulnerability scanner>",\n'
         '  "taxonomy_slug": "view_desync",\n'
         f'  "taxonomy_path": "{default_path}",\n'
         '  "confidence_score": 0.95,\n'
@@ -115,7 +119,12 @@ def run_offline_queue_preprocessing() -> Dict[str, Any]:
     # 3. Process each finding: calculate token length & bucket
     ignored_stubs_count = 0
     STUB_PATTERNS = [
-        "Duplicate of #"
+        "Duplicate of #",
+        "THIS IS A TEST",
+        "no license declaration",
+        "No comments or NatSpecs",
+        "solidity compiler version",
+        "floating pragma"
     ]
 
     for idx, f in enumerate(unprocessed_findings):

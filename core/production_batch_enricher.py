@@ -120,17 +120,24 @@ async def run_production_78k_enrichment(limit: Optional[int] = None, run_inferen
                     affected_constructs_json = json.dumps(data.get("affected_solidity_constructs", []))
                     remediation = data.get("remediation_pattern", "")
                     slug = data.get("taxonomy_slug", tax_path.split("/")[-1])
+                    try:
+                        suitability_score = float(data.get("training_suitability_score", 1.0))
+                    except (ValueError, TypeError):
+                        suitability_score = 1.0
+                    suitability_reason = str(data.get("training_suitability_reason") or "")
 
                     cursor.execute("""
                     INSERT OR REPLACE INTO vuln.enriched_findings_metadata (
                         finding_id, taxonomy_path, vulnerability_summary, root_cause_explanation,
                         attack_vector_steps_json, preconditions_json, impact_scope,
-                        affected_constructs_json, remediation_pattern
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        affected_constructs_json, remediation_pattern,
+                        training_suitability_score, training_suitability_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         finding_id, tax_path, summary, root_cause,
                         attack_steps_json, preconditions_json, impact_scope,
-                        affected_constructs_json, remediation
+                        affected_constructs_json, remediation,
+                        suitability_score, suitability_reason
                     ))
 
                     cursor.execute("""
