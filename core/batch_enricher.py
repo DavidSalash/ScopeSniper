@@ -36,7 +36,7 @@ def _get_stratified_samples(conn: sqlite3.Connection, sample_limit: Optional[int
 def _get_active_taxonomy_guide(conn: sqlite3.Connection) -> List[Dict[str, str]]:
     """Fetches list of active taxonomy path and description records from database."""
     cursor = conn.cursor()
-    cursor.execute("SELECT path, description FROM vuln.vulnerability_taxonomy")
+    cursor.execute("SELECT path, description FROM vuln.vulnerability_taxonomy WHERE description IS NULL OR description NOT LIKE 'Mined pattern tag:%'")
     return [{"path": r["path"], "description": r["description"] or ""} for r in cursor.fetchall()]
 
 def _get_active_taxonomy_paths(conn: sqlite3.Connection) -> List[str]:
@@ -56,7 +56,7 @@ def process_single_finding_enrichment(
     """
     endpoint = cfg.get("vllm_endpoint", "http://192.168.1.57:8000/v1/chat/completions")
     model_name = cfg.get("model_name", "nvidia/Qwen3.6-27B-NVFP4")
-    max_tokens = cfg.get("max_tokens", 2048)
+    max_tokens = cfg.get("max_tokens", 4096)
 
     title = finding.get("title", "Vulnerability Finding")
     content = finding.get("content_markdown", "") or f"Title: {title}"
@@ -79,6 +79,9 @@ def process_single_finding_enrichment(
         "You are an expert smart contract security auditor and AI trainer. "
         "Classify the input finding into our vulnerability taxonomy and extract rich structured metadata.\n"
         f"Valid active taxonomy guide: {json.dumps(taxonomy_guide)}\n"
+        "IMPORTANT CONSTRAINTS:\n"
+        "1. You MUST select a 'taxonomy_path' strictly present in the valid active taxonomy guide above.\n"
+        "2. The array fields ('attack_vector_steps', 'preconditions', 'affected_solidity_constructs') MUST ALWAYS be non-empty lists with at least 1 string element. If details are missing or invalid, describe the finding status (e.g., ['None specified - report lacks details']).\n\n"
         "Output ONLY a valid JSON object strictly matching this payload schema:\n"
         "{\n"
         '  "taxonomy_slug": "view_desync",\n'
@@ -113,38 +116,32 @@ def process_single_finding_enrichment(
     validation_status = "FAIL"
     validation_errors = []
 
-    try:
-        req_data = json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
-        
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
-            resp_bytes = resp.read()
-            resp_json = json.loads(resp_bytes.decode("utf-8"))
-            raw_vllm_response = resp_json["choices"][0]["message"]["content"].strip()
-            extracted_data = json.loads(raw_vllm_response)
-    except Exception:
-        # Fallback payload mock generator for testing/offline environments
-        fallback_obj = {
-            "taxonomy_slug": "view_desync",
-            "taxonomy_path": default_path,
-            "confidence_score": 0.95,
-            "vulnerability_summary": f"State manipulation during callback causing view desync: {title}",
-            "root_cause_explanation": "Contract reads pool state during intermediate callback state.",
-            "attack_vector_steps": [
-                "1. Trigger withdraw function with external callback.",
-                "2. Call dependent contract during intermediate state.",
-                "3. Exploit inflated/deflated balance reading."
-            ],
-            "preconditions": [
-                "Vault relies on direct balances without TWAP guard."
-            ],
-            "impact_scope": "direct_theft_of_user_funds",
-            "affected_solidity_constructs": ["view_function", "fallback", "external_call"],
-            "remediation_pattern": "Implement nonReentrant modifier or read-only guard."
-        }
-        raw_vllm_response = json.dumps(fallback_obj)
-        extracted_data = fallback_obj
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            req_data = json.dumps(payload).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            req = urllib.request.Request(endpoint, data=req_data, headers=headers, method="POST")
+            
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                resp_bytes = resp.read()
+                resp_json = json.loads(resp_bytes.decode("utf-8"))
+                msg = resp_json["choices"][0]["message"]
+                raw_content = msg.get("content") or msg.get("reasoning_content") or ""
+                raw_vllm_response = raw_content.strip()
+                if not raw_vllm_response:
+                    raise ValueError("vLLM response message content is empty or null")
+                extracted_data = json.loads(raw_vllm_response)
+                break
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"[-] vLLM Request Failed for finding {finding['id']} after {max_retries} attempts: {e}")
+                validation_errors.append(f"vLLM Request Error: {e}")
+                raw_vllm_response = None
+                extracted_data = None
+            else:
+                import time
+                time.sleep(1.0 * (attempt + 1))
 
     # Schema & taxonomy path validation
     if not isinstance(extracted_data, dict):
@@ -204,7 +201,7 @@ async def run_enrichment_batch(sample_limit: Optional[int] = None) -> Dict[str, 
     samples = _get_stratified_samples(conn, sample_limit)
     taxonomy_guide = _get_active_taxonomy_guide(conn)
     cfg = get_prompt_config()
-    concurrency_slots = int(cfg.get("concurrency_slots", 32))
+    concurrency_slots = int(cfg.get("concurrency_slots", 16))
 
     processed_count = 0
     results = []
