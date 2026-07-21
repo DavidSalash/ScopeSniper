@@ -13,7 +13,7 @@
   "max_tokens": 4096,
   "concurrency_slots": 32,
   "vllm_endpoint": "http://192.168.1.57:8000/v1/chat/completions",
-  "model_name": "nvidia/Qwen3.6-27B-NVFP4",
+  "model_name": "Kbenkhaled/Qwen3.5-9B-NVFP4",
   "token_bucket_tiers": [
     "less_than_1k",
     "1k_to_2k",

@@ -41,3 +41,6 @@ extract_code.py
 extract_modified.py
 codebase.txt
 modified_codebase.txt
+
+
+audit_logs
