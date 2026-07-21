@@ -55,6 +55,37 @@ def init_vulnerabilities_db():
         )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tag_lookup ON vulnerability_tags_index(tag);")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS vulnerability_taxonomy (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            parent_id INTEGER REFERENCES vulnerability_taxonomy(id) ON DELETE CASCADE,
+            path TEXT UNIQUE NOT NULL,
+            depth INTEGER NOT NULL CHECK (depth BETWEEN 1 AND 4),
+            description TEXT
+        )
+        """)
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS enriched_findings_metadata (
+            finding_id TEXT PRIMARY KEY,
+            taxonomy_path TEXT NOT NULL,
+            vulnerability_summary TEXT,
+            root_cause_explanation TEXT,
+            attack_vector_steps_json TEXT,
+            preconditions_json TEXT,
+            impact_scope TEXT,
+            affected_constructs_json TEXT,
+            remediation_pattern TEXT,
+            processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(finding_id) REFERENCES normalized_findings(id) ON DELETE CASCADE,
+            FOREIGN KEY(taxonomy_path) REFERENCES vulnerability_taxonomy(path)
+        )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_enrich_path ON enriched_findings_metadata(taxonomy_path);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_enrich_impact ON enriched_findings_metadata(impact_scope);")
     conn.close()
 
 def attach_vulnerabilities_db(conn: sqlite3.Connection) -> None:

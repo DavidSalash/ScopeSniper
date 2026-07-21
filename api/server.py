@@ -42,7 +42,7 @@ app.add_middleware(
 def startup_db():
     init_unified_db()
     try:
-        asyncio.create_task(run_state_differential_tracker_loop(interval_seconds=60.0))
+        asyncio.create_task(run_state_differential_tracker_loop(interval_seconds=86400.0))
         print("[+] Launched background state-differential tracking loop.")
     except Exception as e:
         print(f"[-] Failed to launch background tracking daemon: {e}")

@@ -456,6 +456,50 @@ contract HarvestVault {
     harvest_conn.close()
     print(f"      [OK] Source harvester parsed live files (Processed: {processed_count}) and dynamic complexity yield verified.")
 
+    # Test Pass 12: Hybrid Taxonomy Seeder & Stratified Batch Enrichment Invariant
+    print("[12/12] Test Pass 12: Verifying hybrid taxonomy seeder and stratified batch enrichment pipeline...")
+    from core.taxonomy_seeder import seed_hybrid_vulnerability_taxonomy
+    from core.batch_enricher import run_enrichment_batch
+    import asyncio
+
+    tax_conn = get_unified_connection()
+    attach_vulnerabilities_db(tax_conn)
+    t_cursor = tax_conn.cursor()
+
+    # 1. Seed taxonomy and verify nodes >= 30 spanning all 4 levels
+    total_tax_nodes = seed_hybrid_vulnerability_taxonomy(tax_conn)
+    assert total_tax_nodes >= 30, f"Expected total taxonomy nodes >= 30, got {total_tax_nodes}"
+
+    t_cursor.execute("SELECT COUNT(DISTINCT depth) FROM vuln.vulnerability_taxonomy")
+    distinct_depths = t_cursor.fetchone()[0]
+    assert distinct_depths == 4, f"Expected taxonomy depth level coverage == 4, got {distinct_depths}"
+
+    # 2. Run stratified enrichment batch (limit = 15)
+    enrich_out = asyncio.run(run_enrichment_batch(sample_limit=15))
+    assert enrich_out["processed_count"] > 0, "Expected processed_count > 0 in batch enrichment pass"
+
+    # 3. Empirical assertions over enriched_findings_metadata
+    t_cursor.execute("SELECT * FROM vuln.enriched_findings_metadata")
+    enriched_rows = t_cursor.fetchall()
+    assert len(enriched_rows) > 0, "Expected records in vuln.enriched_findings_metadata"
+
+    for r in enriched_rows:
+        # Assert JSON array parsing on vector steps and preconditions
+        steps = json.loads(r["attack_vector_steps_json"])
+        preconds = json.loads(r["preconditions_json"])
+        constructs = json.loads(r["affected_constructs_json"])
+        assert isinstance(steps, list), "attack_vector_steps_json must deserialize to a valid list"
+        assert isinstance(preconds, list), "preconditions_json must deserialize to a valid list"
+        assert isinstance(constructs, list), "affected_constructs_json must deserialize to a valid list"
+
+        # Assert taxonomy_path matches a valid entry in vulnerability_taxonomy
+        t_cursor.execute("SELECT COUNT(*) FROM vuln.vulnerability_taxonomy WHERE path = ?", (r["taxonomy_path"],))
+        path_exists = t_cursor.fetchone()[0]
+        assert path_exists == 1, f"Extracted taxonomy_path '{r['taxonomy_path']}' not found in vulnerability_taxonomy"
+
+    tax_conn.close()
+    print(f"      [OK] Hybrid taxonomy seeded ({total_tax_nodes} nodes across 4 levels) and stratified enrichment batch verified.")
+
     print("\n[SUCCESS] All stability assertions and empirical integration tests PASSED!")
 
 if __name__ == "__main__":
@@ -464,4 +508,5 @@ if __name__ == "__main__":
     seed_preflight_queue()
     test_pipeline_execution()
     run_verification_tests()
+
 

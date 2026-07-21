@@ -97,7 +97,7 @@ In `api/server.py`, the tracker loop is launched asynchronously during FastAPI s
 @app.on_event("startup")
 def startup_db():
     init_unified_db()
-    asyncio.create_task(run_state_differential_tracker_loop(interval_seconds=60.0))
+    asyncio.create_task(run_state_differential_tracker_loop(interval_seconds=86400.0))
 ```
 
 To prevent blocking FastAPI's main HTTP thread during SQLite transaction scans, `run_state_differential_tracker_loop` offloads synchronous database pass execution to a thread pool via `await asyncio.to_thread(run_differential_ingestion_pass)`.
